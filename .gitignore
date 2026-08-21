@@ -1,6 +1,4 @@
-data/splits/
+data/official_longmemeval/
 results/
-data/longmemeval_s/
-data/longmemeval_session_layout.csv
 .DS_Store
 __pycache__/

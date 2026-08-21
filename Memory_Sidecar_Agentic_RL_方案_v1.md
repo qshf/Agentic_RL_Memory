@@ -6,7 +6,7 @@
 
 研究对象：面向长 session archive 的轻量级 **Memory Controller / Memory Sidecar**，而不是让小模型自己承担完整长上下文推理。
 
-本地 LongMemEval S 镜像是受控的、混合来源的多 session haystack，不是自然用户连续日志，也不是在线 Agent 自己生成的工具轨迹。第一阶段验证的是“长历史中的证据压缩与抗干扰”，不能直接外推为真实用户记忆效果。
+LongMemEval 是受控的、混合来源的多 session haystack，不是自然用户连续日志，也不是在线 Agent 自己生成的工具轨迹。第一阶段验证的是“长历史中的证据压缩与抗干扰”，不能直接外推为真实用户记忆效果。
 
 一个 question sample 的 haystack 中位数约 114K token，但 Memory Agent 的单次输入保持短上下文。
 
@@ -47,11 +47,11 @@ Memory Agent 每一步输出：
 
 主数据集：**LongMemEval**。
 
-官方 LongMemEval 发布三个独立文件：`longmemeval_s`、`longmemeval_oracle` 和 `longmemeval_m`，每个文件包含 500 个 evaluation instances。当前本地 1,000 行镜像实际由两部分组成：`dataset_index=0–499` 是 Oracle 风格子集（1–6 个证据 session），`dataset_index=500–999` 是 LongMemEval-S 风格子集（38–62 个混合 filler session，约 115K token）。两部分复用了同一批 `question_id`，所以每个 ID 出现两次；这不是短/长历史配对数据。
+官方 LongMemEval 发布三个独立文件：`longmemeval_s_cleaned.json`、`longmemeval_oracle.json` 和 `longmemeval_m_cleaned.json`，每个文件包含 500 个 evaluation instances。本地官方下载目录为 `data/official_longmemeval/`：S 含 38–62 个 session（主评测），Oracle 只含 1–6 个证据 session（上界），M 含 460–490 个 session（后续扩展）。三者不可合并为 1,000 条或 1,500 条主数据集。
 
-数据单位固定为：`question sample → haystack → 多个 session trajectory → messages`。一个最终问题对应多个 session，不能将 session 当成 question sample。`dataset_index` 唯一标识本地行；`question_id` 标识同一批问题在 Oracle 子集和 S 子集中的对应实例。LongMemEval-S 主评测只使用 `dataset_index=500–999`；前 500 行只用于 Oracle Evidence 对照，不参与 S 主结果的训练/验证切分。session 数组不总是按日期排列，主实验按 `session_date` 从早到晚处理，session 内保持原始消息顺序；`question_date` 不作为截断点。
+数据单位固定为：`question sample → haystack → 多个 session trajectory → messages`。一个最终问题对应多个 session，不能将 session 当成 question sample。同一官方文件内使用 `question_id` 标识样本；跨文件比较时使用 `(split_name, question_id)`。主结果只在 S 的 500 条样本上报告；Oracle 只作 Evidence 上界，不参与 S 的训练或验证切分。
 
-第一轮规模建议：先从 S 子集（`dataset_index=500–999`）抽 50–100 个问题完成 API prototype；验证机制有效后再扩到完整 500 个 S 问题。Oracle 子集用于验证 evidence 上界，不作为训练数据。
+第一轮规模建议：从官方 S 的 500 个问题中选定 50–100 个进行 API prototype；验证机制有效后再扩到完整 S。M 留到机制、预算和成本控制稳定后再运行。
 
 ## 4. 第一阶段：在线 API 可行性验证（当前优先）
 
@@ -63,7 +63,7 @@ Memory Agent 每一步输出：
 2. 使用强模型 API 作为 Memory Agent。每次仅输入“当前 chunk + 当前 compact memory”，输出 `ADD / UPDATE / DELETE / NOOP`，并更新 Memory Store。
 3. 历史全部处理完后，把“最终问题 + compact memory”输入强 Answer Model，生成最终答案。
 4. 使用 benchmark 的 gold answer / 官方 evaluator 计算准确率，并保存每个 question sample 的完整 memory trajectory（逐个 session trajectory/chunk 的记忆更新日志）。
-5. 在 LongMemEval-S 子集上与 Full Context、Rolling Summary、Memory Sidecar 统一比较；使用前 500 行 Oracle 风格子集作为 Oracle Evidence 对照。结果以 `dataset_index` 为 sample 单位，并按问题类型、S 子集 haystack 规模分组报告。
+5. 在官方 LongMemEval-S 上与 Full Context、Rolling Summary、Memory Sidecar 统一比较；另在官方 Oracle 文件上运行 Oracle Evidence 上界。结果以 `(split_name, question_id)` 为样本单位，并按问题类型、S 的 haystack 规模分组报告。
 
 建议的第一版 Memory Store：先保持简单、可读、可审计，不做向量数据库。条目应保留事实/事件、事件时间、当前或已过期状态、来源 session/message。数量题应累计可去重的原子事件集合；知识更新应把旧值标记为 `superseded`，而不是静默删除。
 
