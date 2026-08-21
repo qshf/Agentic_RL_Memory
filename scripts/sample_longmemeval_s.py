@@ -50,6 +50,7 @@ def evidence_diagnostics(row: dict[str, Any]) -> dict[str, int | bool | str]:
 
     evidence_sessions: list[int] = []
     first_evidence_message_indices: list[int] = []
+    first_evidence_rounds: list[int] = []
     evidence_message_count = 0
     for session_index, session in enumerate(sessions):
         message_indices = [
@@ -60,7 +61,9 @@ def evidence_diagnostics(row: dict[str, Any]) -> dict[str, int | bool | str]:
         evidence_message_count += len(message_indices)
         if message_indices:
             evidence_sessions.append(session_index)
-            first_evidence_message_indices.append(min(message_indices))
+            first_message_index = min(message_indices)
+            first_evidence_message_indices.append(first_message_index)
+            first_evidence_rounds.append((first_message_index + 1) // 2)
 
     if not evidence_sessions:
         return {
@@ -69,6 +72,9 @@ def evidence_diagnostics(row: dict[str, Any]) -> dict[str, int | bool | str]:
             "evidence_message_count": 0,
             "first_evidence_session_original_rank": "",
             "first_evidence_session_chronological_rank": "",
+            "evidence_sessions_first_answer_round_1": 0,
+            "evidence_sessions_first_answer_round_2": 0,
+            "evidence_sessions_first_answer_round_3_plus": 0,
             "has_first_round_evidence": False,
         }
 
@@ -79,6 +85,15 @@ def evidence_diagnostics(row: dict[str, Any]) -> dict[str, int | bool | str]:
         "first_evidence_session_original_rank": min(evidence_sessions) + 1,
         "first_evidence_session_chronological_rank": min(
             chronological_rank[index] for index in evidence_sessions
+        ),
+        "evidence_sessions_first_answer_round_1": sum(
+            round_number == 1 for round_number in first_evidence_rounds
+        ),
+        "evidence_sessions_first_answer_round_2": sum(
+            round_number == 2 for round_number in first_evidence_rounds
+        ),
+        "evidence_sessions_first_answer_round_3_plus": sum(
+            round_number >= 3 for round_number in first_evidence_rounds
         ),
         "has_first_round_evidence": any(index <= 2 for index in first_evidence_message_indices),
     }
