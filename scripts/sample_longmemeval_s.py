@@ -5,7 +5,9 @@ written as diagnostic columns and must not be provided to a memory method.
 
 Examples:
     uv run python scripts/sample_longmemeval_s.py
-    uv run python scripts/sample_longmemeval_s.py --size 60 --seed 20260822
+    uv run python scripts/sample_longmemeval_s.py --size 12 --seed 20260822 \
+      --exclude data/samples/longmemeval_s_eval_120_seed_20260821.csv \
+      --output data/samples/longmemeval_s_smoke_12_seed_20260822.csv
 """
 from __future__ import annotations
 
@@ -120,9 +122,27 @@ def manifest_row(row: dict[str, Any], dataset_index: int, seed: int) -> dict[str
     }
 
 
-def sample(rows: list[dict[str, Any]], size: int, seed: int) -> tuple[list[tuple[int, dict[str, Any]]], dict[str, int]]:
+def read_question_ids(manifests: list[Path]) -> set[str]:
+    """Collect question ids already claimed by frozen manifests."""
+    claimed: set[str] = set()
+    for path in manifests:
+        with path.open(encoding="utf-8") as file:
+            claimed.update(row["question_id"] for row in csv.DictReader(file))
+    return claimed
+
+
+def sample(
+    rows: list[dict[str, Any]],
+    size: int,
+    seed: int,
+    exclude: set[str] | None = None,
+) -> tuple[list[tuple[int, dict[str, Any]]], dict[str, int]]:
+    """Select `size` rows, keeping `dataset_index` anchored to the source file."""
+    excluded = exclude or set()
     grouped: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     for dataset_index, row in enumerate(rows):
+        if row["question_id"] in excluded:
+            continue
         grouped[row["question_type"]].append((dataset_index, row))
 
     counts = Counter({question_type: len(group) for question_type, group in grouped.items()})
@@ -151,16 +171,26 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="CSV manifest path")
     parser.add_argument("--size", type=int, default=120, help="Number of S samples to select")
     parser.add_argument("--seed", type=int, default=20260821, help="Deterministic random seed")
+    parser.add_argument(
+        "--exclude",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="Frozen manifests whose question_ids must not be reused",
+    )
     args = parser.parse_args()
 
     with args.source.open(encoding="utf-8") as file:
         source_rows = json.load(file)
-    selected, quotas = sample(source_rows, args.size, args.seed)
+    excluded = read_question_ids(args.exclude)
+    selected, quotas = sample(source_rows, args.size, args.seed, excluded)
     manifest = [manifest_row(row, dataset_index, args.seed) for dataset_index, row in selected]
     write_manifest(manifest, args.output)
 
-    print(f"Selected {len(manifest)} of {len(source_rows)} LongMemEval-S samples")
+    print(f"Selected {len(manifest)} of {len(source_rows) - len(excluded)} eligible LongMemEval-S samples")
     print(f"Seed: {args.seed}")
+    if excluded:
+        print(f"Excluded {len(excluded)} question ids from {len(args.exclude)} frozen manifest(s)")
     print(f"Manifest: {args.output}")
     print("Question-type quotas:")
     for question_type in sorted(quotas):

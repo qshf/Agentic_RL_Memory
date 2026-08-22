@@ -1,0 +1,119 @@
+{
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "questionId",
+      "type": "promptString",
+      "description": "question_id from the smoke manifest (e.g. 6f9b354f)",
+      "default": "6f9b354f"
+    },
+    {
+      "id": "runId",
+      "type": "promptString",
+      "description": "run id (results/rolling_summary/<run_id>/)",
+      "default": "debug-single"
+    }
+  ],
+  "configurations": [
+    {
+      "name": "Rolling Summary: 单条样本 (manifest 第一条)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_rolling_summary.py",
+      "args": [
+        "--manifest", "data/samples/longmemeval_s_smoke_12_seed_20260822.csv",
+        "--run-id", "debug-single",
+        "--limit", "1"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Rolling Summary: 指定 question_id",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_rolling_summary.py",
+      "args": [
+        "--manifest", "data/samples/longmemeval_s_smoke_12_seed_20260822.csv",
+        "--run-id", "${input:runId}",
+        "--question-id", "${input:questionId}"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Rolling Summary: 小预算快跑 (少量 token, 多次压缩)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_rolling_summary.py",
+      "args": [
+        "--manifest", "data/samples/longmemeval_s_smoke_12_seed_20260822.csv",
+        "--run-id", "debug-tiny-budget",
+        "--limit", "1",
+        "--rolling-trigger-tokens", "20000",
+        "--summary-budget-tokens", "1000",
+        "--raw-tail-budget-tokens", "3000",
+        "--final-context-budget-tokens", "4000"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Full Context: 单条样本",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_rolling_summary.py",
+      "args": [
+        "--manifest", "data/samples/longmemeval_s_smoke_12_seed_20260822.csv",
+        "--run-id", "debug-full-context",
+        "--method", "full_context",
+        "--limit", "1"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Sampler: 重建 12 条冒烟清单",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/sample_longmemeval_s.py",
+      "args": [
+        "--size", "12",
+        "--seed", "20260822",
+        "--exclude", "data/samples/longmemeval_s_eval_120_seed_20260821.csv",
+        "--output", "data/samples/longmemeval_s_smoke_12_seed_20260822.csv"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "Pytest: 全部离线测试",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-q"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "Pytest: 当前打开的测试文件",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["${file}", "-v"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    }
+  ]
+}
