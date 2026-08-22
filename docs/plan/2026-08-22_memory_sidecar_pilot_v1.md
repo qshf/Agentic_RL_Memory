@@ -35,6 +35,28 @@
 
 这样可以先回答“结构化 Sidecar 架构是否有效”，避免把 memory schema、模型能力和二次摘要三个变量同时改变。
 
+## 1.2 recent raw tail 的控制
+
+第一轮必须让所有实验组使用相同的 recent raw tail 策略。否则 Sidecar 可能只是因为看到了更多最近原文而提升，无法归因于结构化记忆。
+
+具体规则：
+
+- 为 pilot 预先固定一个 `recent_tail_budget_tokens`，建议先使用 16K tokens；
+- tail 按相同 canonical renderer、相同消息边界和相同 token 计数方式截取；
+- Rolling V1 pilot 和 Sidecar-Strong pilot 都使用这份相同的 tail snapshot；
+- 不允许某个方法因为自己的 memory 状态变长而动态扩大 tail；
+- 旧的 `rolling-summary-eval120-v1-atomic-c2` 仍作为历史基线保留，但它的 raw tail 没有独立固定上限，不能直接与本 pilot 的准确率做严格因果比较；
+- pilot 报告必须单独记录 `memory_tokens`、`recent_tail_tokens` 和 `answer_input_tokens`。
+
+因此，本 pilot 的对照应理解为：
+
+```text
+共同 recent tail + Rolling memory
+共同 recent tail + Sidecar memory
+```
+
+只有在 Sidecar-Strong 验证完成后，才增加“无 tail”“更短 tail”或“不同 tail budget”的消融实验。
+
 V1 Rolling Summary 已作为冻结基线，结果和错误归因记录在：
 
 - `docs/plan/2026-08-21_rolling_summary_baseline_v1_evaluation.md`
