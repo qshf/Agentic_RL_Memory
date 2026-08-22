@@ -1,6 +1,7 @@
 data/official_longmemeval/
 data/samples/
 results/
+docs/plan/rolling_summary_v1_manual_review.html
 .DS_Store
 __pycache__/
 .env
