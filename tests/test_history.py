@@ -31,14 +31,12 @@ def test_parse_session_date_ignores_weekday():
     assert parse_session_date("2023/05/20 (Sat) 02:21").isoformat() == "2023-05-20T02:21:00"
 
 
-def test_same_role_messages_merge_with_source_range():
+def test_cleaned_messages_are_not_merged_again_at_runtime():
     row = make_row(session_count=1, messages_per_session=4)
     row["haystack_sessions"][0][1]["role"] = "user"
     stream = build_message_stream(chronological_sessions(row))
-    assert [(m.role, m.first_message_index, m.last_message_index, m.source_message_indices) for m in stream.messages] == [
-        ("user", 0, 2, (0, 1, 2)), ("assistant", 3, 3, (3,))
-    ]
-    assert "\n\ns0m1w0" in stream.messages[0].content
+    assert [message.role for message in stream.messages] == ["user", "user", "user", "assistant"]
+    assert stream.messages[1].content == row["haystack_sessions"][0][1]["content"]
 
 
 def test_sessions_are_one_continuous_stream_with_rendered_headers():

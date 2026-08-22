@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS states (
     event           TEXT NOT NULL,
     created_at      REAL NOT NULL,
     summary_text    TEXT,
-    raw_tail_text   TEXT,
+    raw_text        TEXT,
     summary_tokens  INTEGER NOT NULL,
     raw_tail_tokens INTEGER NOT NULL,
     history_tokens  INTEGER NOT NULL,
@@ -106,6 +106,9 @@ class TrajectoryStore:
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(states)")}
+        if "raw_tail_text" in columns and "raw_text" not in columns:
+            self.conn.execute("ALTER TABLE states RENAME COLUMN raw_tail_text TO raw_text")
         self.conn.commit()
 
     def close(self) -> None:
@@ -221,13 +224,14 @@ class TrajectoryStore:
         event: str,
         state: RollingState,
         summary_text: str | None,
+        raw_text: str | None = None,
         detail: dict[str, Any] | None = None,
     ) -> int:
         del parent_step_id
         with self.conn:
             cursor = self.conn.execute(
                 "INSERT INTO states (sample_id, step_ordinal, event, created_at, summary_text, "
-                "raw_tail_text, summary_tokens, raw_tail_tokens, history_tokens, detail) "
+                "raw_text, summary_tokens, raw_tail_tokens, history_tokens, detail) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     sample_id,
@@ -235,7 +239,7 @@ class TrajectoryStore:
                     event,
                     time.time(),
                     summary_text,
-                    state.render_tail(),
+                    raw_text,
                     state.summary_tokens,
                     state.tail_tokens,
                     state.history_tokens,

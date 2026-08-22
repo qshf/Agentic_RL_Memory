@@ -48,3 +48,9 @@ class LocalQwenTokenizer:
     def tokenizer_path(self) -> Path | None:
         """Resolved local path after the first load (None until then)."""
         return Path(self._tokenizer_path) if self._tokenizer_path else None
+
+    def clone(self) -> "LocalQwenTokenizer":
+        """Create an independent encoder that reuses the downloaded tokenizer file."""
+        self._load()
+        assert self._tokenizer_path is not None
+        return LocalQwenTokenizer(repo_id=self._repo_id, tokenizer_path=self._tokenizer_path)

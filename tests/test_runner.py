@@ -10,6 +10,7 @@ from conftest import FakeClient, make_row
 
 from rolling_summary.client import ApiError, QwenClient
 from rolling_summary.config import METHOD_FULL_CONTEXT, METHOD_ROLLING_SUMMARY, ModelConfig
+from rolling_summary import prompts
 from rolling_summary.runner import process_sample, run
 from rolling_summary.store import STATUS_COMPLETED, STATUS_FAILED, STATUS_NOT_RUNNABLE, TrajectoryStore
 
@@ -86,6 +87,24 @@ def test_the_question_appears_only_in_the_final_answer_request(store, budgets):
     assert with_question == [len(client.requests) - 1]
 
 
+def test_final_answer_prompt_ends_with_the_question(store, budgets):
+    client, _sample_id, _outcome = run_sample(store, budgets, session_count=3)
+    final_prompt = client.requests[-1]["messages"][1]["content"]
+    assert final_prompt.rstrip().endswith("SECRETQUESTION what did I say about the thing?")
+
+
+def test_prompts_require_atomic_facts_and_direct_factual_answers():
+    summary_prompt = prompts.summary_messages("old memory", "older history", 100)[1]["content"]
+    assert "Atomic facts" in summary_prompt
+    assert "assistant-sourced" in summary_prompt
+    assert "Never replace an exact value with a range" in summary_prompt
+
+    answer_prompt = prompts.answer_messages("memory", "tail", "2023/06/01", "What is the count?")[1]["content"]
+    assert "exact final conclusion first" in answer_prompt
+    assert "never give a conclusion that contradicts" in answer_prompt
+    assert answer_prompt.rstrip().endswith("What is the count?")
+
+
 def test_summary_requests_are_capped_at_the_summary_budget(store, budgets):
     client, _sample_id, _outcome = run_sample(
         store, budgets, session_count=12, messages_per_session=6, words_per_message=9
@@ -121,6 +140,25 @@ def test_calls_and_states_are_persisted(store, budgets):
 
     assert count("calls") == outcome["call_count"] == outcome["compression_count"] + 1
     assert count("states") >= count("calls")
+
+
+def test_state_log_repeats_summary_and_stores_one_raw_message(store, budgets):
+    _client, sample_id, _outcome = run_sample(
+        store, budgets, session_count=12, messages_per_session=6, words_per_message=9
+    )
+    rows = store.conn.execute(
+        "SELECT step_ordinal, event, summary_text, raw_text FROM states "
+        "WHERE sample_id=? ORDER BY step_ordinal", (sample_id,)
+    ).fetchall()
+    compression_index = next(index for index, row in enumerate(rows) if row["event"] == "rolling_compression")
+    summary = rows[compression_index]["summary_text"]
+    assert summary
+    assert rows[compression_index]["raw_text"] is None
+    following_ingest = rows[compression_index + 1]
+    assert following_ingest["event"] == "ingest"
+    assert following_ingest["summary_text"] == summary
+    assert following_ingest["raw_text"].startswith(("## Session", "User:", "Assistant:"))
+    assert all(row["raw_text"] is None for row in rows if row["event"] != "ingest")
 
 
 def test_summary_calls_record_their_outputs(store, budgets):
@@ -331,7 +369,22 @@ def test_config_json_records_the_frozen_protocol(tmp_path, budgets):
     assert config["model"]["enable_thinking"] is False
     assert config["prompt_version"] and config["code_version"] and config["config_fingerprint"]
     assert config["manifest"]["sha256"]
+    assert config["execution"] == {"max_concurrency": 1}
     assert "api_key" not in json.dumps(config).lower().replace("api_key_env", "")
+
+
+def test_run_rejects_invalid_concurrency(tmp_path, budgets):
+    manifest, source = write_fixture_manifest(tmp_path, ["q1"])
+    with pytest.raises(ValueError, match="max_concurrency"):
+        run(
+            manifest_path=manifest,
+            run_id="r1",
+            source_path=source,
+            results_root=tmp_path / "results",
+            budgets=budgets,
+            client=PreflightingFakeClient(),
+            max_concurrency=0,
+        )
 
 
 def test_rerunning_the_same_run_id_skips_completed_samples(tmp_path, budgets):
@@ -367,8 +420,7 @@ def test_a_changed_fingerprint_refuses_to_reuse_the_run_id(tmp_path, budgets):
     changed = type(budgets)(
         rolling_trigger_tokens=budgets.rolling_trigger_tokens,
         summary_budget_tokens=budgets.summary_budget_tokens,
-        raw_tail_budget_tokens=budgets.raw_tail_budget_tokens - 1,
-        final_context_budget_tokens=budgets.final_context_budget_tokens,
+        compress_prefix_tokens=budgets.compress_prefix_tokens - 1,
     )
     with pytest.raises(ValueError, match="Use a new --run-id"):
         run(budgets=changed, client=PreflightingFakeClient(), **kwargs)

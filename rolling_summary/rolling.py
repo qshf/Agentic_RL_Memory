@@ -37,7 +37,6 @@ class Compression:
     previous_summary_sha256: str
     previous_summary_tokens: int
     new_summary_tokens: int
-    over_budget: bool
     cut_index: int
     candidate_tokenize_calls: int
 
@@ -63,6 +62,7 @@ class RollingSummaryEngine:
         self.on_state = on_state
         self.state = RollingState()
         self.compressions: list[Compression] = []
+        self._last_session_index: int | None = None
 
     def _emit(self, event: str, detail: dict | None = None) -> None:
         if self.on_state is not None:
@@ -73,8 +73,9 @@ class RollingSummaryEngine:
         header = f"## Session {message.session_index + 1} — {message.session_date}"
         return self.tokenizer.count(header)
 
-    def _message_tokens(self, message: HistoryMessage) -> int:
-        # 单条消息的增量 token：内容 +（若开启新 session）header。O(1)。
+    def _message_token_delta(self, message: HistoryMessage) -> int:
+        # 仅维护 rolling trigger 所需的总量，不寻找压缩切点。单条消息的
+        # 增量 token 为内容 +（若开启新 session）header，复杂度 O(1)。
         tokens = self.tokenizer.count(message.rendered)
         if len(self.state.tail) == 1 or self.state.tail[-2].session_index != message.session_index:
             tokens += self._header_tokens(message)
@@ -85,40 +86,45 @@ class RollingSummaryEngine:
         return self.tokenizer.count(text) if text else 0
 
     def _legal_cuts(self) -> list[int]:
-        # A cut is a prefix length. It can only be zero or after assistant.
-        return [0, *(index for index, message in enumerate(self.state.tail, 1) if message.role == "assistant")]
+        """Return prefix lengths that end at the stream start or an assistant."""
+        return [
+            0,
+            *(index for index, message in enumerate(self.state.tail, 1) if message.role == "assistant"),
+        ]
 
     def _find_cut(self) -> tuple[int, int]:
-        """Binary-search the earliest legal cut whose suffix fits the raw budget."""
-        cuts = self._legal_cuts()
-        if len(cuts) == 1:
+        """Find the earliest legal assistant cut whose prefix reaches budget."""
+        tail = self.state.tail
+        n = len(tail)
+        if n <= 1:
             return 0, 0
-
+        budget = self.budgets.compress_prefix_tokens
+        legal_cuts = self._legal_cuts()
         calls = 0
 
-        def suffix_tokens(cut: int) -> int:
+        def prefix_tokens(cut: int) -> int:
             nonlocal calls
             calls += 1
-            return self._tail_tokens(self.state.tail[cut:])
+            return self._tail_tokens(tail[:cut])
 
-        # Token count of a suffix decreases as cut moves right. Find the first
-        # legal cut satisfying the raw-tail budget, with a final exact check.
-        if suffix_tokens(cuts[-1]) > self.budgets.raw_tail_budget_tokens:
-            return cuts[-1], calls
-        lo, hi = 0, len(cuts) - 1
-        while lo < hi:
+        lo, hi = 1, len(legal_cuts) - 1
+        found: int | None = None
+        while lo <= hi:
             mid = (lo + hi) // 2
-            if suffix_tokens(cuts[mid]) <= self.budgets.raw_tail_budget_tokens:
-                hi = mid
+            if prefix_tokens(legal_cuts[mid]) >= budget:
+                found = legal_cuts[mid]
+                hi = mid - 1
             else:
                 lo = mid + 1
-        cut = cuts[lo]
-        suffix_tokens(cut)
-        return cut, calls
+        if found is not None:
+            return found, calls
+
+        earlier = [cut for cut in legal_cuts[1:] if cut < n]
+        return (earlier[-1] if earlier else 0), calls
 
     def _compress(self, reason: str) -> None:
-        # 压缩流程：1) 二分找出最早合法切割点；2) 前缀被驱逐并交给 summarize 总结；
-        # 3) 用「新 summary + 保留 tail」重建状态并记录压缩档案。
+        # 压缩流程：1) 找切点（保留最后一个完整回合）；2) 前缀被驱逐并交给
+        # summarize 总结；3) 用「新 summary + 保留 tail」重建状态并记录压缩档案。
         cut, tokenize_calls = self._find_cut()
         if cut == 0:
             self.state.terminal_issue = "no_legal_assistant_cut"
@@ -131,8 +137,6 @@ class RollingSummaryEngine:
         summary_tokens = self.tokenizer.count(summary) if summary else 0
         tail_tokens = self._tail_tokens(kept)
         history_tokens = summary_tokens + tail_tokens
-        # 压缩后仍超预算（summary 或整体上下文超限）则标记 terminal_issue。
-        over_budget = summary_tokens > self.budgets.summary_budget_tokens or history_tokens > self.budgets.final_context_budget_tokens
         self.state = RollingState(
             summary=summary,
             summary_tokens=summary_tokens,
@@ -147,33 +151,31 @@ class RollingSummaryEngine:
             previous_summary_sha256=sha256_text(previous_summary),
             previous_summary_tokens=previous_tokens,
             new_summary_tokens=summary_tokens,
-            over_budget=over_budget,
             cut_index=cut,
             candidate_tokenize_calls=tokenize_calls,
         )
         self.compressions.append(compression)
         self._emit(reason, {"compression": compression})
-        if over_budget:
-            self.state.terminal_issue = "memory_budget_exceeded"
 
     def ingest(self, message: HistoryMessage) -> None:
-        # 增量维护：只对新增这条做本地 count（含新 session 的 header），O(1)；
-        # 不再每次全量重算 tail，避免 O(n²) 渲染/编码。压缩只在 assistant
-        # 消息到达后触发，保证切割点落在完整的 assistant 回合之后。
+        # 先增量维护 trigger 计数；这里不是切点搜索，也不扫描已有 tail。
+        # 真正触发后，_compress() 再仅在合法 assistant 边界上做二分查找。
         self.state.tail.append(message)
-        self.state.tail_tokens += self._message_tokens(message)
+        self.state.tail_tokens += self._message_token_delta(message)
         self.state.history_tokens = self.state.summary_tokens + self.state.tail_tokens
-        self._emit("ingest", {"unit_ordinal": message.unit_ordinal})
+        raw_text = message.rendered
+        if self._last_session_index != message.session_index:
+            raw_text = f"{message.session_header}\n{raw_text}"
+        self._last_session_index = message.session_index
+        self._emit("ingest", {"unit_ordinal": message.unit_ordinal, "raw_text": raw_text})
         # A user message may make the stream temporarily too large. Compression
         # is only legal once its corresponding assistant response has arrived.
         if message.role == "assistant" and self.state.history_tokens > self.budgets.rolling_trigger_tokens:
             self._compress("rolling_compression")
 
     def finalize(self) -> RollingState:
-        # 收尾：若整体仍超最终上下文预算则强制压缩；若末尾是未配对的 user
-        # 消息则记录 terminal_issue（该回合无法被安全切割）。
-        if self.state.history_tokens > self.budgets.final_context_budget_tokens:
-            self._compress("final_flush")
+        # 收尾：压缩只由 rolling_trigger 触发，这里不再做任何兜底压缩。
+        # 若末尾是未配对的 user 消息则记录 terminal_issue（该回合无法被安全切割）。
         if self.state.tail and self.state.tail[-1].role == "user":
             self.state.terminal_issue = self.state.terminal_issue or "terminal_unpaired_user"
         self._emit("final", {})

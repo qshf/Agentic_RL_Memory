@@ -45,21 +45,9 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class BudgetConfig:
-    rolling_trigger_tokens: int = 100 * 1024
+    rolling_trigger_tokens: int = 80 * 1024
     summary_budget_tokens: int = 8 * 1024
-    raw_tail_budget_tokens: int = 16 * 1024
-    final_context_budget_tokens: int = 24 * 1024
-
-    def __post_init__(self) -> None:
-        if self.summary_budget_tokens + self.raw_tail_budget_tokens > self.final_context_budget_tokens:
-            raise ValueError("summary + raw tail budgets must fit the final context budget")
-        if self.final_context_budget_tokens >= self.rolling_trigger_tokens:
-            raise ValueError("final context budget must be below the rolling trigger")
-
-    @property
-    def max_unit_tokens(self) -> int:
-        """A history chunk must always be able to sit inside the raw tail alone."""
-        return self.raw_tail_budget_tokens
+    compress_prefix_tokens: int = 80 * 1024
 
 
 def read_api_key() -> str:

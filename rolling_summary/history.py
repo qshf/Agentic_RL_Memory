@@ -20,7 +20,6 @@ class Tokenizer(Protocol):
 @dataclass(frozen=True)
 class SourceMessage:
     session_index: int
-    message_index: int
     role: str
     content: str
 
@@ -50,16 +49,17 @@ class HistoryMessage:
     session_index: int
     session_id: str
     session_date: str
-    first_message_index: int
-    last_message_index: int
     role: str
     content: str
-    source_message_indices: tuple[int, ...]
     is_split_degraded: bool = False
 
     @property
     def rendered(self) -> str:
         return f"{self.role.capitalize()}: {self.content}"
+
+    @property
+    def session_header(self) -> str:
+        return f"## Session {self.session_index + 1} — {self.session_date}"
 
     @property
     def content_sha256(self) -> str:
@@ -102,11 +102,10 @@ def chronological_sessions(row: dict[str, Any]) -> list[Session]:
         messages = tuple(
             SourceMessage(
                 session_index=position,
-                message_index=message_index,
                 role=message["role"],
                 content=message.get("content") or "",
             )
-            for message_index, message in enumerate(row["haystack_sessions"][original_index])
+            for message in row["haystack_sessions"][original_index]
         )
         sessions.append(Session(position, session_ids[original_index], dates[original_index], original_index, messages))
     return sessions
@@ -140,11 +139,8 @@ def _as_history_messages(messages: Sequence[SourceMessage], session: Session) ->
             session_index=session.session_index,
             session_id=session.session_id,
             session_date=session.date,
-            first_message_index=message.message_index,
-            last_message_index=message.message_index,
             role=message.role,
             content=message.content,
-            source_message_indices=(message.message_index,),
         )
         for index, message in enumerate(messages)
     )
@@ -156,52 +152,25 @@ def build_message_stream(
     max_unit_tokens: int | None = None,
     client=None,
 ) -> HistoryStream:
-    """Merge same-role messages within each session and concatenate sessions.
+    """Concatenate the already-cleaned sessions into one message stream.
 
     ``max_unit_tokens`` is retained for API compatibility. Normal messages are
-    never split merely because they exceed the raw-tail budget. A tokenizer
-    boundary split is only used when a caller explicitly supplies a client and
-    the message itself exceeds that client's model context.
+    never split merely because they exceed the raw-tail budget.
     """
     del tokenizer, max_unit_tokens
     normalized: list[HistoryMessage] = []
-    ordinal = 0
     for session in sessions:
-        current: HistoryMessage | None = None
         for source in session.messages:
-            # 连续同角色消息合并成一个逻辑单元；跨 session 永不合并。
-            if current is not None and current.role == source.role:
-                current = HistoryMessage(
-                    # 合并：单元序号和 session 元数据沿用旧值，
-                    # 只扩展 last_message_index、拼接 content 并追加来源索引。
-                    unit_ordinal=current.unit_ordinal,
-                    session_index=current.session_index,
-                    session_id=current.session_id,
-                    session_date=current.session_date,
-                    first_message_index=current.first_message_index,
-                    last_message_index=source.message_index,
-                    role=current.role,
-                    content=f"{current.content}\n\n{source.content}",
-                    source_message_indices=current.source_message_indices + (source.message_index,),
-                )
-            else:
-                # 角色切换或进入新 session：先落盘上一个合并单元，再开启新单元。
-                if current is not None:
-                    normalized.append(current)
-                current = HistoryMessage(
-                    unit_ordinal=ordinal,
+            normalized.append(
+                HistoryMessage(
+                    unit_ordinal=len(normalized),
                     session_index=session.session_index,
                     session_id=session.session_id,
                     session_date=session.date,
-                    first_message_index=source.message_index,
-                    last_message_index=source.message_index,
                     role=source.role,
                     content=source.content,
-                    source_message_indices=(source.message_index,),
                 )
-                ordinal += 1
-        if current is not None:
-            normalized.append(current)
+            )
     return HistoryStream(tuple(normalized))
 
 

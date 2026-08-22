@@ -102,6 +102,7 @@ def test_states_keep_summary_snapshots_without_overwriting(store):
         event="rolling_compression",
         state=after,
         summary_text=after.summary,
+        raw_text=None,
         detail={"evicted_ordinals": [0]},
     )
 
@@ -111,7 +112,8 @@ def test_states_keep_summary_snapshots_without_overwriting(store):
     assert len(rows) == 2, "the pre-compression state must survive"
     assert json.loads(rows[1]["detail"])["evicted_ordinals"] == [0]
     assert rows[0]["summary_text"] is None and rows[1]["summary_text"] == "memory v1"
-    assert rows[0]["raw_tail_text"]
+    assert rows[0]["raw_text"] is None
+    assert rows[1]["raw_text"] is None
     assert second != first
 
 

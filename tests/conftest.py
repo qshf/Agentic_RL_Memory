@@ -89,8 +89,7 @@ def budgets() -> BudgetConfig:
     return BudgetConfig(
         rolling_trigger_tokens=200,
         summary_budget_tokens=20,
-        raw_tail_budget_tokens=40,
-        final_context_budget_tokens=60,
+        compress_prefix_tokens=80,
     )
 
 

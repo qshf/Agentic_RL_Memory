@@ -24,11 +24,8 @@ def make_message(ordinal: int, tokens: int, role: str = "assistant") -> HistoryM
         session_index=0,
         session_id="s0",
         session_date="2023/05/20 (Sat) 02:21",
-        first_message_index=ordinal,
-        last_message_index=ordinal,
         role=role,
         content=" ".join(f"m{ordinal}w{i}" for i in range(tokens)),
-        source_message_indices=(ordinal,),
     )
 
 
@@ -55,8 +52,10 @@ def test_compression_prefix_ends_after_assistant_and_tail_is_contiguous(budgets,
     _memory, history, reason = summarizer.calls[0]
     assert reason == "rolling_compression"
     assert history.index("m0w0") < history.index("m1w0")
-    assert engine.state.tail_ordinals == list(range(10, 12))
-    assert engine.compressions[0].cut_index == 10
+    # 触发发生在 ordinal 9（assistant）累计超线：驱逐前缀直到累计达到
+    # compress_prefix(80)，即 ordinal 0..3；后续 10、11 继续 ingest，tail 连续为 [4..11]。
+    assert engine.state.tail_ordinals == list(range(4, 12))
+    assert engine.compressions[0].cut_index == 4
 
 
 def test_repeated_compression_feeds_previous_summary_back(budgets, tokenizer):
@@ -71,29 +70,20 @@ def test_repeated_compression_feeds_previous_summary_back(budgets, tokenizer):
     assert all(c.candidate_tokenize_calls <= 8 for c in engine.compressions)
 
 
-def test_final_flush_runs_when_history_exceeds_final_budget(budgets, tokenizer):
+def test_finalize_does_not_compress_below_trigger(budgets, tokenizer):
     summarizer = RecordingSummarizer()
     engine = build_engine(budgets, summarizer, tokenizer)
     for ordinal in range(4):
         engine.ingest(make_message(ordinal, 20, "user" if ordinal % 2 == 0 else "assistant"))
     assert summarizer.calls == []
     state = engine.finalize()
-    assert summarizer.calls[-1][2] == "final_flush"
-    assert state.tail_tokens <= budgets.raw_tail_budget_tokens
-
-
-def test_over_budget_summary_is_recorded(budgets, tokenizer):
-    summarizer = RecordingSummarizer(words=budgets.summary_budget_tokens + 5)
-    engine = build_engine(budgets, summarizer, tokenizer)
-    for ordinal in range(4):
-        engine.ingest(make_message(ordinal, 20, "user" if ordinal % 2 == 0 else "assistant"))
-    engine.finalize()
-    assert engine.compressions[0].over_budget
-    assert engine.state.terminal_issue == "memory_budget_exceeded"
+    # 压缩只由 rolling_trigger 触发，finalize 不做兜底压缩
+    assert summarizer.calls == []
+    assert state.tail_ordinals == [0, 1, 2, 3]
 
 
 def test_terminal_user_is_kept_and_marked():
-    budgets = BudgetConfig(rolling_trigger_tokens=200, summary_budget_tokens=20, raw_tail_budget_tokens=40, final_context_budget_tokens=60)
+    budgets = BudgetConfig(rolling_trigger_tokens=200, summary_budget_tokens=20, compress_prefix_tokens=80)
     from tests.conftest import FakeClient
     from rolling_summary.client import TokenCounter
     engine = RollingSummaryEngine(summarize=RecordingSummarizer(), tokenizer=TokenCounter(FakeClient()), budgets=budgets)
@@ -104,18 +94,18 @@ def test_terminal_user_is_kept_and_marked():
 
 
 def test_stream_end_to_end_uses_message_boundaries(tokenizer):
-    budgets = BudgetConfig(rolling_trigger_tokens=400, summary_budget_tokens=20, raw_tail_budget_tokens=60, final_context_budget_tokens=100)
+    budgets = BudgetConfig(rolling_trigger_tokens=400, summary_budget_tokens=20, compress_prefix_tokens=100)
     stream = build_message_stream(chronological_sessions(make_row(session_count=12, messages_per_session=6, words_per_message=9)))
     engine = build_engine(budgets, RecordingSummarizer(), tokenizer)
     for message in stream.messages:
         engine.ingest(message)
     state = engine.finalize()
-    assert state.history_tokens <= budgets.final_context_budget_tokens or state.terminal_issue
+    # 压缩后状态 = summary + 保留末尾（不设上限），应低于触发线 + summary 预算
+    assert state.history_tokens <= budgets.rolling_trigger_tokens + budgets.summary_budget_tokens
 
 
 def test_default_budgets_match_frozen_protocol():
     budgets = BudgetConfig()
-    assert budgets.rolling_trigger_tokens == 102_400
+    assert budgets.rolling_trigger_tokens == 80 * 1024
     assert budgets.summary_budget_tokens == 8_192
-    assert budgets.raw_tail_budget_tokens == 16_384
-    assert budgets.final_context_budget_tokens == 24_576
+    assert budgets.compress_prefix_tokens == 80 * 1024

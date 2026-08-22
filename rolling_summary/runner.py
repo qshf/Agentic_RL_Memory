@@ -9,8 +9,10 @@ import csv
 import gc
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
+from queue import SimpleQueue
 from typing import Any, Sequence
 
 from . import prompts
@@ -154,6 +156,8 @@ class SampleRunner:
 
     def record_state(self, event: str, state: RollingState, detail: dict[str, Any]) -> None:
         self.step_ordinal += 1
+        detail = dict(detail)
+        raw_text = detail.pop("raw_text", None)
         compression = detail.pop("compression", None)
         if compression is not None:
             detail = {**detail, **asdict(compression)}
@@ -164,7 +168,8 @@ class SampleRunner:
             parent_step_id=self.parent_step_id,
             event=event,
             state=state,
-            summary_text=state.summary if compression is not None or event == "final" else None,
+            summary_text=state.summary or None,
+            raw_text=raw_text,
             detail=detail or None,
         )
 
@@ -253,7 +258,7 @@ def process_sample(
     # 保证切割点总落在完整 assistant 回合之后。全程不读取问题（query-independent）。
     for message in stream.messages:
         engine.ingest(message)
-    # 收尾：若仍超最终上下文预算则强制压缩；末尾若为未配对 user 消息则标记 terminal_issue。
+    # 收尾不做兜底压缩；rolling trigger 只在 assistant ingest 时触发，末尾 user 仅标记 terminal_issue。
     state = engine.finalize()
 
     messages = prompts.answer_messages(
@@ -306,6 +311,7 @@ def build_config(
     manifest_path: Path,
     source_path: Path,
     preflight: dict[str, Any],
+    max_concurrency: int,
 ) -> dict[str, Any]:
     return {
         "method": method,
@@ -315,6 +321,7 @@ def build_config(
         "model": asdict(model),
         "budgets": asdict(budgets),
         "budget_unit_tokens": 1024,
+        "execution": {"max_concurrency": max_concurrency},
         "manifest": {
             # 记录本次用哪份清单及其 sha256，保证结果可溯源（换清单 = 新实验）
             "path": str(manifest_path),
@@ -342,7 +349,10 @@ def run(
     limit: int | None = None,
     question_ids: Sequence[str] | None = None,
     tokenizer: Tokenizer | None = None,
+    max_concurrency: int = 1,
 ) -> dict[str, Any]:
+    if max_concurrency < 1:
+        raise ValueError("max_concurrency must be at least 1")
     budgets = budgets or BudgetConfig()
     model = model or ModelConfig.from_env()
     client = client or QwenClient(model, read_api_key())
@@ -371,6 +381,7 @@ def run(
         manifest_path=manifest_path,
         source_path=source_path,
         preflight=preflight,
+        max_concurrency=max_concurrency,
     )
     run_dir = results_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -382,6 +393,11 @@ def run(
                 f"run {run_id} was created with fingerprint {existing['config_fingerprint']}; "
                 f"the current config is {config['config_fingerprint']}. Use a new --run-id."
             )
+        if existing.get("execution", {}).get("max_concurrency", 1) != max_concurrency:
+            raise ValueError(
+                f"run {run_id} was created with max_concurrency="
+                f"{existing.get('execution', {}).get('max_concurrency', 1)}; use a new --run-id."
+            )
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     store = TrajectoryStore(run_dir / "trajectory.sqlite3")
@@ -390,48 +406,96 @@ def run(
     done = store.completed_question_ids(run_id, config["config_fingerprint"])
     pending = [row for row in manifest if row["question_id"] not in done]
     print(f"{len(manifest)} samples in manifest, {len(done)} already done, {len(pending)} to run")
+    store.close()
 
     # --- 2) 回源取数：按“待跑”的 question_id 从大 JSON 里捞真实对话（只捞本批） ---
     source = load_source(source_path, {row["question_id"] for row in pending}) if pending else {}
-    # --- 3) 逐条跑：manifest 的“指针”在这里被解引用成 source[question_id] 的真实对话数据 ---
-    for position, manifest_row in enumerate(pending, start=1):
-        question_id = manifest_row["question_id"]
-        sample_id = store.start_sample(
-            run_id,
-            question_id,
-            dataset_index=int(manifest_row["dataset_index"]) if manifest_row.get("dataset_index") else None,
-            question_type=manifest_row.get("question_type"),
-            config_fingerprint=config["config_fingerprint"],
-            code_version=config["code_version"],
-        )
-        try:
-            outcome = process_sample(
-                source[question_id],
-                client=client,
-                budgets=budgets,
-                store=store,
-                sample_id=sample_id,
-                method=method,
-                tokenizer=tokenizer,
-            )
-        except (ApiError, ValueError, KeyError) as error:
-            store.finish_sample(sample_id, STATUS_FAILED, error=f"{type(error).__name__}: {error}")
-            print(f"[{position}/{len(pending)}] {question_id} FAILED: {error}")
-            continue
-        status = outcome.pop("status")
-        store.finish_sample(sample_id, status, **outcome)
-        print(
-            f"[{position}/{len(pending)}] {question_id} {status} "
-            f"compressions={outcome['compression_count']} "
-            f"answer_in={outcome['answer_input_tokens']} out={outcome['answer_output_tokens']}"
-        )
+    # Each worker owns its HTTP session and SQLite connection. The server can
+    # then continuously batch independent requests without sharing clients or
+    # SQLite connections across threads.
+    if max_concurrency > 1 and not isinstance(client, QwenClient):
+        raise ValueError("max_concurrency > 1 requires a QwenClient")
+    worker_tokenizers: SimpleQueue[Tokenizer] | None = None
+    if max_concurrency > 1 and tokenizer is not None:
+        clone = getattr(tokenizer, "clone", None)
+        if not callable(clone):
+            raise ValueError("max_concurrency > 1 requires a cloneable tokenizer")
+        worker_tokenizers = SimpleQueue()
+        for _ in range(max_concurrency):
+            worker_tokenizers.put(clone())
 
+    db_path = run_dir / "trajectory.sqlite3"
+
+    def run_one(position: int, manifest_row: dict[str, str]) -> tuple[int, str, str, dict[str, Any]]:
+        question_id = manifest_row["question_id"]
+        worker_store = TrajectoryStore(db_path)
+        worker_client = client if max_concurrency == 1 else QwenClient(model, read_api_key())
+        worker_tokenizer = worker_tokenizers.get() if worker_tokenizers is not None else tokenizer
+        try:
+            sample_id = worker_store.start_sample(
+                run_id,
+                question_id,
+                dataset_index=int(manifest_row["dataset_index"]) if manifest_row.get("dataset_index") else None,
+                question_type=manifest_row.get("question_type"),
+                config_fingerprint=config["config_fingerprint"],
+                code_version=config["code_version"],
+            )
+            try:
+                outcome = process_sample(
+                    source[question_id],
+                    client=worker_client,
+                    budgets=budgets,
+                    store=worker_store,
+                    sample_id=sample_id,
+                    method=method,
+                    tokenizer=worker_tokenizer,
+                )
+            except (ApiError, ValueError, KeyError) as error:
+                worker_store.finish_sample(sample_id, STATUS_FAILED, error=f"{type(error).__name__}: {error}")
+                return position, question_id, STATUS_FAILED, {"error": str(error)}
+            status = outcome.pop("status")
+            worker_store.finish_sample(sample_id, status, **outcome)
+            return position, question_id, status, outcome
+        finally:
+            if worker_tokenizers is not None:
+                worker_tokenizers.put(worker_tokenizer)
+            worker_store.close()
+
+    processing_started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+        futures = [
+            executor.submit(run_one, position, manifest_row)
+            for position, manifest_row in enumerate(pending, start=1)
+        ]
+        for future in as_completed(futures):
+            position, question_id, status, outcome = future.result()
+            if status == STATUS_FAILED:
+                print(f"[{position}/{len(pending)}] {question_id} FAILED: {outcome['error']}")
+                continue
+            print(
+                f"[{position}/{len(pending)}] {question_id} {status} "
+                f"compressions={outcome['compression_count']} "
+                f"answer_in={outcome['answer_input_tokens']} out={outcome['answer_output_tokens']}"
+            )
+    wall_time_ms = int((time.monotonic() - processing_started) * 1000)
+
+    store = TrajectoryStore(db_path)
     exported = store.export_hypotheses(run_id, run_dir / "hypotheses.jsonl")
     statistics = store.run_statistics(run_id)
     statistics["run_id"] = run_id
     statistics["method"] = method
     statistics["config_fingerprint"] = config["config_fingerprint"]
     statistics["hypotheses_exported"] = exported
+    statistics["execution"] = {
+        "max_concurrency": max_concurrency,
+        "wall_time_ms": wall_time_ms,
+        "samples_per_second": len(pending) / (wall_time_ms / 1000) if wall_time_ms else 0.0,
+        "model_tokens_per_second": (
+            (statistics["total_input_tokens"] + statistics["total_output_tokens"]) / (wall_time_ms / 1000)
+            if wall_time_ms
+            else 0.0
+        ),
+    }
     (run_dir / "run_summary.json").write_text(
         json.dumps(statistics, ensure_ascii=False, indent=2), encoding="utf-8"
     )

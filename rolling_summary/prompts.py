@@ -6,7 +6,7 @@ question, the question date, or any gold field.
 """
 from __future__ import annotations
 
-PROMPT_VERSION = "rolling-summary-v1"
+PROMPT_VERSION = "rolling-summary-v1-atomic-facts-question-last"
 
 SUMMARY_SYSTEM = (
     "You maintain a long-term memory of an ongoing conversation between a user and an "
@@ -16,14 +16,38 @@ SUMMARY_SYSTEM = (
 
 SUMMARY_INSTRUCTIONS = """Rewrite the current memory and the older history below into a single consolidated memory of at most {budget} tokens.
 
-Requirements:
-- Faithfully preserve user facts, preferences, plans, dates and times, relationships, numbers, and state changes.
-- Preserve information the assistant explicitly provided that the user may refer back to later.
-- When something is contradicted or updated, keep both the old and the new value and say when each was stated.
-- Keep the session date attached to the facts that came from that session.
-- Do not invent anything, do not speculate about what may be asked later, and do not filter the content toward any particular topic.
-- Carry forward everything already in the current memory that is not superseded; the discarded history will not be available again.
-- Output the memory itself as compact notes for a future assistant. Do not explain the compression, and do not add a preamble."""
+Use this priority order:
+1. Atomic facts: preserve each answerable fact as a compact labeled record in the form
+   [date if known | source] entity | attribute or relationship | exact value | qualifier.
+   The qualifier carries scope such as "first order", "in the first three months",
+   "by July", "last week", or "at time of death".
+2. Exact user facts: names, places, organizations, products, quantities, prices,
+   dates, times, durations, identifiers, and relationships.
+3. Preferences and constraints: likes, dislikes, habits, goals, requirements,
+   and the context in which each preference applies.
+4. Temporal state: events in chronological order, plans, completed actions,
+   current status, and changes from an older value to a newer value.
+5. Multi-step facts: counts, comparisons, rankings, sequences, causes, and outcomes.
+6. Concrete assistant-provided facts: preserve named entity definitions, lists,
+   calculations, comparisons, and procedures even if the user did not explicitly
+   accept them. Label these records "assistant-sourced" rather than converting them
+   into user facts.
+
+Rules:
+- Preserve atomic facts before writing a broad profile or topical summary.
+- Keep exact names, numbers, dates, units, and quoted terms unchanged.
+- Never replace an exact value with a range, approximation, or plus sign. Do not
+  drop a count's scope, date, comparison target, or ordering condition.
+- Carry forward current memory unless it is superseded.
+- When facts conflict, retain each incompatible value with its source and date.
+  Do not silently choose one or merge them into a new value.
+- Keep the session date attached to every atomic fact whose chronology or scope
+  could affect a later answer.
+- Remove greetings, small talk, generic advice, repeated confirmations, and filler.
+- Do not invent, speculate, or filter toward a particular final question.
+- The final question, answer, and evidence labels are unavailable and must not be inferred.
+- Output only compact labeled notes for a future assistant. Do not explain the compression
+  and do not add a preamble."""
 
 SUMMARY_USER = """{instructions}
 
@@ -49,10 +73,17 @@ ANSWER_USER = """# Memory of older conversation history
 # Current date
 {question_date}
 
-# Question
-{question}
+Use only the memory and history above. For a direct factual, numeric, comparison,
+ranking, or arithmetic question, reconcile the relevant evidence before answering and
+give the exact final conclusion first. Do not replace an exact value with an estimate,
+and never give a conclusion that contradicts the values stated in the same answer.
+When dated facts conflict, use the latest applicable dated fact no later than the
+current date; only mention the conflict when it prevents a determinate answer.
+Reply with the answer itself, concisely and directly, with no preamble and no
+explanation of the context.
 
-Answer the question using only the memory and history above. Reply with the answer itself, concisely and directly, with no preamble and no explanation of the context."""
+# Question
+{question}"""
 
 NO_MEMORY = "(no older history was compressed; the full history is shown below)"
 NO_RAW_TAIL = "(none)"
@@ -68,10 +99,17 @@ FULL_CONTEXT_USER = """# Conversation history (verbatim)
 # Current date
 {question_date}
 
-# Question
-{question}
+Use only the conversation history above. For a direct factual, numeric, comparison,
+ranking, or arithmetic question, reconcile the relevant evidence before answering and
+give the exact final conclusion first. Do not replace an exact value with an estimate,
+and never give a conclusion that contradicts the values stated in the same answer.
+When dated facts conflict, use the latest applicable dated fact no later than the
+current date; only mention the conflict when it prevents a determinate answer.
+Reply with the answer itself, concisely and directly, with no preamble and no
+explanation of the context.
 
-Answer the question using only the history above. Reply with the answer itself, concisely and directly, with no preamble and no explanation of the context."""
+# Question
+{question}"""
 
 
 def summary_messages(memory: str, history: str, budget_tokens: int) -> list[dict[str, str]]:
