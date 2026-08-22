@@ -13,6 +13,28 @@
 
 > 在相同最终 Answer Model 下，结构化增量记忆能否比自然语言 Rolling Summary 更少丢失关键事实，同时降低最终答案上下文成本。
 
+## 1.1 当前执行决策
+
+第一步只执行 **Sidecar-Strong**，不同时引入小模型和 Rolling Summary 混合压缩：
+
+```text
+固定 Rolling Summary V1 基线
+        对照
+强模型 Memory Manager → 结构化 memory_state → 强模型 Answer Model
+```
+
+具体约束：
+
+- Rolling Summary V1 的 prompt、预算和切点保持不变，只作为对照组；
+- Sidecar-Strong 的 Memory Manager 使用强模型 API，先验证 schema、事件协议和状态更新逻辑；
+- Sidecar-Strong 实验组不调用 Rolling Summary，也不让大模型二次读取全部历史做自然语言摘要；
+- 最终 Answer Model 固定不变，读取 `memory_state + bounded recent raw tail + question`；
+- 不加入原生工具调用，文件写入和状态更新由 runner/规则引擎执行；
+- Sidecar-Strong 只有在 24 条 pilot 上通过门槛后，才进入 Sidecar-Small；
+- Sidecar-Small 通过后，才评估“Sidecar + 大模型 compactor”的混合方案。
+
+这样可以先回答“结构化 Sidecar 架构是否有效”，避免把 memory schema、模型能力和二次摘要三个变量同时改变。
+
 V1 Rolling Summary 已作为冻结基线，结果和错误归因记录在：
 
 - `docs/plan/2026-08-21_rolling_summary_baseline_v1_evaluation.md`
@@ -162,7 +184,7 @@ LongMemEval 的单条消息不一定等于一个自然 turn。第一版采用：
 | Sidecar-Small | 5090 上的小模型输出结构化 memory event | 同一个强模型 | 验证成本和小模型可行性 |
 | Oracle/Full 对照 | gold evidence 或完整可行上下文 | 同一个强模型 | 估计证据上限和答案上限 |
 
-第一轮应先运行 Rolling V1 与 Sidecar-Strong。只有 Sidecar-Strong 在关键指标上有收益，才运行 Sidecar-Small；否则先修改 schema 和更新策略，不进入小模型训练。
+第一轮只运行 Rolling V1 与 Sidecar-Strong。Sidecar-Strong 的 manager 和最终 Answer Model 可以使用同一强模型服务，但两者必须分别记录 prompt、调用次数和 token。只有 Sidecar-Strong 在关键指标上有收益，才运行 Sidecar-Small；否则先修改 schema 和更新策略，不进入小模型训练，也不引入 compactor。
 
 ### 7.3 固定变量
 
@@ -216,6 +238,8 @@ Sidecar-Small 的判定分两层：
 
 - 使用强模型作为 memory manager；
 - 不使用原生工具调用；
+- Sidecar 组不调用 Rolling Summary；
+- 最终回答输入固定为 `memory_state + bounded recent raw tail + question`；
 - 运行 Rolling V1 与 Sidecar-Strong；
 - 比较 evidence sufficiency、最终答案和成本。
 
@@ -229,6 +253,7 @@ Sidecar-Small 的判定分两层：
 ### P3：扩展与否决
 
 - 通过 pilot 门槛后扩展到 120 条；
+- Sidecar-Small 通过后，再增加“大模型只压缩旧事件/非活跃记录”的 compactor 对照；
 - 仍然有效才考虑蒸馏和 RL；
 - 若只改善 memory recall、不改善最终 QA，转向 Answer prompt、证据选择和 verifier，而不是继续扩大 Sidecar。
 
@@ -250,4 +275,3 @@ Sidecar-Small 的判定分两层：
 3. 结构化记忆是否降低最终上下文长度；
 4. 提升来自 memory recall，还是来自最终 Answer Model 的偶然波动；
 5. 是否值得进入 SFT/RL。
-
