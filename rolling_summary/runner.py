@@ -5,8 +5,6 @@ history-processing stage is query-independent by construction.
 """
 from __future__ import annotations
 
-import csv
-import gc
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,38 +34,10 @@ from .store import (
     STATUS_NOT_RUNNABLE,
     TrajectoryStore,
 )
+from utils.dataset import load_source, read_manifest
 
 DEFAULT_SOURCE = ROOT / "data" / "official_longmemeval" / "longmemeval_s_cleaned.json"
 DEFAULT_RESULTS_ROOT = ROOT / "results" / "rolling_summary"
-
-
-def read_manifest(path: Path) -> list[dict[str, str]]:
-    # manifest 是冻结的 CSV 样本清单（如 data/samples/longmemeval_s_smoke_12_*.csv），
-    # 由 scripts/sample_longmemeval_s.py 从源 JSON 按 question_type 分层抽样生成。
-    # 每行只含元信息（question_id / dataset_index / question_type / 证据诊断列），不含对话原文。
-    # csv.DictReader 按表头把每行读成 dict[str, str]，返回的就是本批待跑样本的“指针清单”。
-    with path.open(encoding="utf-8") as file:
-        rows = list(csv.DictReader(file))
-    if not rows:
-        raise ValueError(f"manifest {path} is empty")
-    return rows
-
-
-def load_source(path: Path, question_ids: set[str]) -> dict[str, dict[str, Any]]:
-    """Keep only the manifest's rows; the full S file is several GB in memory."""
-    # 回源取数：manifest 只是指针，真实对话数据在 S 源 JSON（约 277MB）里。
-    # 只按 question_id 过滤出本批要跑的行，避免把整个大文件常驻内存。
-    with path.open(encoding="utf-8") as file:
-        rows = json.load(file)
-    selected = {row["question_id"]: row for row in rows if row["question_id"] in question_ids}
-    del rows  # 立即释放源列表引用，配合下面的 gc.collect() 让内存尽快回落
-    gc.collect()
-    missing = question_ids - selected.keys()
-    if missing:
-        # manifest 引用了源文件中不存在的 question_id，说明清单与数据版本不一致
-        raise ValueError(f"manifest references {len(missing)} unknown question ids: {sorted(missing)[:5]}")
-    return selected
-
 
 class SampleRunner:
     """One sample's worth of state: chunking, compression, answering, logging."""

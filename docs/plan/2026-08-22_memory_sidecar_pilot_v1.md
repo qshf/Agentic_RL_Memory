@@ -1,5 +1,8 @@
 # Memory Sidecar 方案一：快速可行性验证计划
 
+当前 Sidecar-Strong V1 的代码结构、实际 token 计数、SQLite 轨迹 schema 和已验证范围见
+[Memory Sidecar Strong V1 实施记录](2026-08-22_memory_sidecar_strong_v1_implementation.md)。本文保留研究假设、实验门槛和后续阶段设计；实施记录不等同于实验结果。
+
 ## 1. 目的
 
 本计划建立在已完成的 Rolling Summary V1 基线上，验证第一个 Memory Sidecar 方案：
@@ -28,7 +31,7 @@
 - Rolling Summary V1 的 prompt、预算和切点保持不变，只作为对照组；
 - Sidecar-Strong 的 Memory Manager 使用强模型 API，先验证 schema、事件协议和状态更新逻辑；
 - Sidecar-Strong 实验组不调用 Rolling Summary，也不让大模型二次读取全部历史做自然语言摘要；
-- 最终 Answer Model 固定不变，读取 `memory_state + bounded recent raw tail + question`；
+- 最终 Answer Model 固定不变，从 `sidecar_memory(sample_id)` 恢复完整记忆，再读取 `bounded recent raw tail + question`；
 - 不加入原生工具调用，文件写入和状态更新由 runner/规则引擎执行；
 - Sidecar-Strong 只有在 24 条 pilot 上通过门槛后，才进入 Sidecar-Small；
 - Sidecar-Small 通过后，才评估“Sidecar + 大模型 compactor”的混合方案。
@@ -86,9 +89,10 @@ V1 的 120 条样本结果为 73/120，DeepSeek judge 准确率 60.83%。人工�
 小模型只处理当前 turn/chunk 和当前 memory state，输出结构化 memory event：
 
 - `ADD`：新增事实、偏好、事件、计划或可复用 assistant fact；
-- `UPDATE`：已有事实发生时间或状态变化；
-- `SUPERSEDE`：明确旧值失效，由新值替代；
+- `UPDATE`：已有事实发生时间、状态或值变化；旧版本标记为 `superseded`，新版本追加为当前记录；
 - `NOOP`：没有值得长期保留的信息。
+
+V1 已知缺陷：当前实现对已有 active key 的不同 value `ADD` 直接返回 `rejected_add_conflict`，不会自动判断是补充还是替换；旧值继续 active，新候选只保留在事件审计中。下一版的冲突路由方案（包括 `merge`、`UPDATE`、`conflict_pending`，以及 superseded 旧值是否进入 Answer 投影）单独记录在：[Memory Sidecar Memory Conflict 修复方案](2026-08-23_memory_sidecar_memory_conflict_resolution_v1.md)。
 
 小模型不负责：
 
@@ -100,7 +104,7 @@ V1 的 120 条样本结果为 73/120，DeepSeek judge 准确率 60.83%。人工�
 
 ### 3.2 大模型职责
 
-最终 Answer Model 读取：
+最终 Answer Model 从 `sidecar_memory(sample_id)` 恢复完整记忆后读取：
 
 ```text
 current_memory_state
@@ -120,11 +124,11 @@ current_memory_state
 
 ```json
 {
-  "action": "ADD|UPDATE|SUPERSEDE|NOOP",
+  "action": "ADD|UPDATE|NOOP",
   "memory_type": "fact|preference|event|plan|assistant_fact",
   "key": "finance.wells_fargo.preapproval",
   "value": "$400,000",
-  "status": "active|superseded|planned|completed",
+  "status": "active|planned|completed",
   "event_date": "2023-08-20",
   "source": {
     "session_id": "session_xxx",
@@ -154,12 +158,13 @@ current_memory_state
 
 ## 5. 存储设计
 
-第一版使用“追加事件 + 当前状态”两层结构，文件是可读接口，SQLite 是可回放存储。
+第一版使用“追加事件 + 当前状态”两层结构；当前代码将原计划中的文件接口落地为 SQLite，SQLite 同时保存事件、长期记忆、状态快照和模型调用轨迹。
 
 ```text
-memory_events.jsonl   # append-only，每次 ADD/UPDATE/SUPERSEDE/NOOP 一行
-memory_state.json     # 根据事件日志物化的当前有效记忆
-trajectory.sqlite3    # 实验级 provenance、模型调用、状态快照和成本
+trajectory.sqlite3
+  sidecar_events     # append-only manager 事件与路由结果
+  sidecar_memory     # 每个 sample 的完整长期记忆库
+  sidecar_states     # 每个事件后的状态快照
 ```
 
 事件必须保留：
@@ -170,7 +175,7 @@ trajectory.sqlite3    # 实验级 provenance、模型调用、状态快照和成
 - 小模型原始 JSON、校验结果和错误信息；
 - `content_sha256` 或规范化事件 hash，便于去重和回放。
 
-当前状态只保留 active/planned 等可供回答的记录；被 supersede 的事件不能删除，必须能回放出旧值和更新顺序。
+当前状态只保留 active/planned 等可供回答的记录；被 supersede 的事件不能删除，必须能回放出旧值和更新顺序。最终 Answer 从 `sidecar_memory(sample_id)` 恢复完整 records，不直接依赖 prompt 的滑动窗口。
 
 ## 6. turn/chunk 处理规则
 
@@ -178,7 +183,7 @@ LongMemEval 的单条消息不一定等于一个自然 turn。第一版采用：
 
 1. 清洗阶段保留同 session 内连续同 role 合并结果；
 2. 优先按 `user -> assistant` 组成一个 turn；
-3. 没有完整 user/assistant 对时，按最多 4--8 条逻辑消息组成 chunk；
+3. 同一 session 内没有完整 `user -> assistant` 对的消息保留为单条 unit；chunk 由连续的完整 turn/unit 按 token budget 累积，不按固定消息条数切分；
 4. 每次小模型只收到当前 chunk 和当前 `memory_state`，不收到最终问题；
 5. 普通寒暄、重复确认和无事实内容应输出 `NOOP`；
 6. 数字、日期、金额、状态变化、偏好、计划和 assistant 提供的可复用事实必须保留来源。
@@ -254,7 +259,7 @@ Sidecar-Small 的判定分两层：
 - 定义 JSON schema 和 event validator；
 - 从 V1 trajectory 生成 Sidecar 输入；
 - 实现 JSONL event log、state materializer 和 SQLite 记录；
-- 用固定样例验证 ADD/UPDATE/SUPERSEDE/NOOP。
+- 用固定样例验证 ADD/UPDATE/NOOP。
 
 ### P1：Strong manager 上限
 

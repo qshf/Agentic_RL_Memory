@@ -23,8 +23,8 @@ from rolling_summary.config import (  # noqa: E402
     BudgetConfig,
     ModelConfig,
 )
-from rolling_summary.local_tokenizer import LocalQwenTokenizer  # noqa: E402
 from rolling_summary.runner import DEFAULT_RESULTS_ROOT, DEFAULT_SOURCE, run  # noqa: E402
+from utils.local_tokenizer import LocalQwenTokenizer  # noqa: E402
 
 
 def main() -> None:

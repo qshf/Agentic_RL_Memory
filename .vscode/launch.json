@@ -12,6 +12,18 @@
       "type": "promptString",
       "description": "run id (results/rolling_summary/<run_id>/)",
       "default": "debug-single"
+    },
+    {
+      "id": "sidecarQuestionId",
+      "type": "promptString",
+      "description": "Sidecar question_id from the 120-sample manifest",
+      "default": "51a45a95"
+    },
+    {
+      "id": "sidecarRunId",
+      "type": "promptString",
+      "description": "Sidecar debug run id",
+      "default": "debug-sidecar"
     }
   ],
   "configurations": [
@@ -74,6 +86,49 @@
         "--run-id", "debug-full-context",
         "--method", "full_context",
         "--limit", "1"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Memory Sidecar Strong: 前 1 个 chunk 调试",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_memory_sidecar_strong.py",
+      "args": [
+        "--manifest", "data/samples/longmemeval_s_eval_120_seed_20260821.csv",
+        "--run-id", "${input:sidecarRunId}",
+        "--question-id", "${input:sidecarQuestionId}",
+        "--debug-max-chunks", "1",
+        "--chunk-budget-tokens", "2048",
+        "--manager-context-budget-tokens", "12288",
+        "--active-memory-budget-tokens", "8192",
+        "--update-ledger-budget-tokens", "2048",
+        "--recent-tail-budget-tokens", "16384",
+        "--max-concurrency", "1"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Memory Sidecar Strong: 单条样本全流程",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_memory_sidecar_strong.py",
+      "args": [
+        "--manifest", "data/samples/longmemeval_s_eval_120_seed_20260821.csv",
+        "--run-id", "${input:sidecarRunId}",
+        "--question-id", "${input:sidecarQuestionId}",
+        "--chunk-budget-tokens", "2048",
+        "--manager-context-budget-tokens", "12288",
+        "--active-memory-budget-tokens", "8192",
+        "--update-ledger-budget-tokens", "2048",
+        "--recent-tail-budget-tokens", "16384",
+        "--max-concurrency", "1"
       ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
