@@ -159,6 +159,87 @@ CREATE INDEX IF NOT EXISTS idx_sidecar_events_sample ON sidecar_events(sample_id
 CREATE INDEX IF NOT EXISTS idx_sidecar_states_sample ON sidecar_states(sample_id, event_ordinal);
 CREATE INDEX IF NOT EXISTS idx_sidecar_context_baseline ON sidecar_context(baseline_sample_id);
 CREATE INDEX IF NOT EXISTS idx_sidecar_memory_sample_key ON sidecar_memory(sample_id, key, status);
+
+-- Memory Sidecar V2 uses immutable version rows and separates a model batch from
+-- the individual candidate items returned in its events array.
+CREATE TABLE IF NOT EXISTS sidecar_batches (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id                  INTEGER NOT NULL REFERENCES samples(id),
+    batch_ordinal              INTEGER NOT NULL,
+    source_unit_ordinals_json  TEXT NOT NULL,
+    input_text                 TEXT NOT NULL,
+    memory_before_json         TEXT NOT NULL,
+    raw_response               TEXT,
+    parse_status               TEXT NOT NULL,
+    created_at                 REAL NOT NULL,
+    UNIQUE(sample_id, batch_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS sidecar_event_items (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id            INTEGER NOT NULL REFERENCES sidecar_batches(id),
+    item_ordinal        INTEGER NOT NULL,
+    model_event_json    TEXT NOT NULL,
+    parse_status        TEXT NOT NULL,
+    route_status        TEXT NOT NULL,
+    route_result_json   TEXT,
+    created_record_ref  TEXT,
+    created_at          REAL NOT NULL,
+    UNIQUE(batch_id, item_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS sidecar_memory_v2 (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id                    INTEGER NOT NULL REFERENCES samples(id),
+    record_ref                   TEXT NOT NULL,
+    created_by_event_item_id     INTEGER REFERENCES sidecar_event_items(id),
+    created_by_reconciliation_item_id INTEGER,
+    prior_record_ref             TEXT,
+    key                          TEXT NOT NULL,
+    record_type                  TEXT NOT NULL,
+    attributes_json              TEXT NOT NULL,
+    temporal_json                TEXT NOT NULL,
+    source_refs_json             TEXT NOT NULL,
+    field_provenance_json        TEXT NOT NULL,
+    semantic_status              TEXT NOT NULL,
+    lifecycle                    TEXT NOT NULL,
+    superseded_by_record_ref     TEXT,
+    created_at                   REAL NOT NULL,
+    UNIQUE(sample_id, record_ref)
+);
+
+CREATE TABLE IF NOT EXISTS sidecar_states_v2 (
+    sample_id       INTEGER NOT NULL REFERENCES samples(id),
+    batch_ordinal   INTEGER NOT NULL,
+    state_json      TEXT NOT NULL,
+    state_sha256    TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    PRIMARY KEY(sample_id, batch_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS sidecar_reconciliation_batches (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id           INTEGER NOT NULL REFERENCES samples(id),
+    memory_before_json  TEXT NOT NULL,
+    raw_response        TEXT,
+    parse_status        TEXT NOT NULL,
+    state_after_json    TEXT,
+    state_after_sha256  TEXT,
+    created_at          REAL NOT NULL,
+    UNIQUE(sample_id)
+);
+
+CREATE TABLE IF NOT EXISTS sidecar_reconciliation_items (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_batch_id INTEGER NOT NULL REFERENCES sidecar_reconciliation_batches(id),
+    group_ordinal         INTEGER NOT NULL,
+    model_group_json      TEXT NOT NULL,
+    route_status           TEXT NOT NULL,
+    route_result_json     TEXT,
+    created_record_ref    TEXT,
+    created_at            REAL NOT NULL,
+    UNIQUE(reconciliation_batch_id, group_ordinal)
+);
 """
 
 
@@ -176,6 +257,9 @@ class TrajectoryStore:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(states)")}
         if "raw_tail_text" in columns and "raw_text" not in columns:
             self.conn.execute("ALTER TABLE states RENAME COLUMN raw_tail_text TO raw_text")
+        v2_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(sidecar_memory_v2)")}
+        if v2_columns and "source_refs_json" not in v2_columns:
+            self.conn.execute("ALTER TABLE sidecar_memory_v2 ADD COLUMN source_refs_json TEXT NOT NULL DEFAULT '[]'")
         self.conn.commit()
 
     def close(self) -> None:
@@ -475,6 +559,119 @@ class TrajectoryStore:
                 record["superseded_by"] = row["superseded_by"]
             records.append(record)
         return records
+
+    # V2 persistence -----------------------------------------------------
+    def record_sidecar_batch(
+        self,
+        sample_id: int,
+        *,
+        batch_ordinal: int,
+        source_unit_ordinals: Iterable[int],
+        input_text: str,
+        memory_before_json: str,
+        raw_response: str | None,
+        parse_status: str,
+    ) -> int:
+        """Persist one manager call (the container for multiple event items)."""
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO sidecar_batches (sample_id,batch_ordinal,source_unit_ordinals_json,input_text,"
+                "memory_before_json,raw_response,parse_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (sample_id, batch_ordinal, json.dumps(list(source_unit_ordinals)), input_text,
+                 memory_before_json, raw_response, parse_status, time.time()),
+            )
+        return int(cursor.lastrowid)
+
+    def record_sidecar_event_item(
+        self,
+        batch_id: int,
+        *,
+        item_ordinal: int,
+        model_event: Any,
+        parse_status: str,
+        route_status: str,
+        route_result: Any = None,
+        created_record_ref: str | None = None,
+    ) -> int:
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO sidecar_event_items (batch_id,item_ordinal,model_event_json,parse_status,"
+                "route_status,route_result_json,created_record_ref,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (batch_id, item_ordinal, json.dumps(model_event, ensure_ascii=False, sort_keys=True),
+                 parse_status, route_status,
+                 json.dumps(route_result, ensure_ascii=False, sort_keys=True) if route_result is not None else None,
+                 created_record_ref, time.time()),
+            )
+        return int(cursor.lastrowid)
+
+    def sync_sidecar_memory_v2(self, sample_id: int, records: Iterable[dict[str, Any]]) -> None:
+        """Upsert immutable V2 versions without deleting superseded history."""
+        with self.conn:
+            for record in records:
+                self.conn.execute(
+                    "INSERT INTO sidecar_memory_v2 (sample_id,record_ref,created_by_event_item_id,"
+                    "created_by_reconciliation_item_id,prior_record_ref,key,record_type,attributes_json,"
+                    "temporal_json,source_refs_json,field_provenance_json,semantic_status,lifecycle,superseded_by_record_ref,created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(sample_id,record_ref) DO UPDATE SET "
+                    "lifecycle=excluded.lifecycle,superseded_by_record_ref=excluded.superseded_by_record_ref",
+                    (sample_id, record["record_ref"], record.get("created_by_event_item_id"),
+                     record.get("created_by_reconciliation_item_id"), record.get("prior_record_ref"),
+                     record["key"], record["record_type"], json.dumps(record.get("attributes", {}), ensure_ascii=False, sort_keys=True),
+                     json.dumps(record.get("temporal", {}), ensure_ascii=False, sort_keys=True),
+                     json.dumps(record.get("source_refs", []), ensure_ascii=False, sort_keys=True),
+                     json.dumps(record.get("field_provenance", {}), ensure_ascii=False, sort_keys=True),
+                     record["semantic_status"], record["lifecycle"], record.get("superseded_by_record_ref"), time.time()),
+                )
+
+    def load_sidecar_memory_v2(self, sample_id: int, *, current_only: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM sidecar_memory_v2 WHERE sample_id=?"
+        params: list[Any] = [sample_id]
+        if current_only:
+            query += " AND lifecycle='current'"
+        query += " ORDER BY id"
+        rows = self.conn.execute(query, params).fetchall()
+        return [{
+            "record_ref": row["record_ref"], "prior_record_ref": row["prior_record_ref"],
+            "key": row["key"], "record_type": row["record_type"],
+            "attributes": json.loads(row["attributes_json"]), "temporal": json.loads(row["temporal_json"]),
+            "source_refs": json.loads(row["source_refs_json"]),
+            "field_provenance": json.loads(row["field_provenance_json"]),
+            "semantic_status": row["semantic_status"], "lifecycle": row["lifecycle"],
+            "superseded_by_record_ref": row["superseded_by_record_ref"],
+        } for row in rows]
+
+    def record_sidecar_state_v2(self, sample_id: int, *, batch_ordinal: int, state_json: str, state_sha256: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sidecar_states_v2 (sample_id,batch_ordinal,state_json,state_sha256,created_at) VALUES (?,?,?,?,?)",
+                (sample_id, batch_ordinal, state_json, state_sha256, time.time()),
+            )
+
+    def record_sidecar_reconciliation_batch(
+        self, sample_id: int, *, memory_before_json: str, raw_response: str | None,
+        parse_status: str, state_after_json: str | None = None, state_after_sha256: str | None = None,
+    ) -> int:
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO sidecar_reconciliation_batches (sample_id,memory_before_json,raw_response,"
+                "parse_status,state_after_json,state_after_sha256,created_at) VALUES (?,?,?,?,?,?,?)",
+                (sample_id, memory_before_json, raw_response, parse_status, state_after_json, state_after_sha256, time.time()),
+            )
+        return int(cursor.lastrowid)
+
+    def record_sidecar_reconciliation_item(
+        self, batch_id: int, *, group_ordinal: int, model_group: Any,
+        route_status: str, route_result: Any = None, created_record_ref: str | None = None,
+    ) -> int:
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO sidecar_reconciliation_items (reconciliation_batch_id,group_ordinal,"
+                "model_group_json,route_status,route_result_json,created_record_ref,created_at) VALUES (?,?,?,?,?,?,?)",
+                (batch_id, group_ordinal, json.dumps(model_group, ensure_ascii=False, sort_keys=True), route_status,
+                 json.dumps(route_result, ensure_ascii=False, sort_keys=True) if route_result is not None else None,
+                 created_record_ref, time.time()),
+            )
+        return int(cursor.lastrowid)
 
     def export_hypotheses(self, run_id: str, output: Path) -> int:
         rows = self.conn.execute(

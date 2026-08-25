@@ -24,6 +24,18 @@
       "type": "promptString",
       "description": "Sidecar debug run id",
       "default": "debug-sidecar"
+    },
+    {
+      "id": "sidecarV2QuestionId",
+      "type": "promptString",
+      "description": "V2 Sidecar question_id from the 120-sample manifest",
+      "default": "gpt4_d84a3211"
+    },
+    {
+      "id": "sidecarV2RunId",
+      "type": "promptString",
+      "description": "V2 Sidecar debug run id",
+      "default": "debug-sidecar-v2"
     }
   ],
   "configurations": [
@@ -127,6 +139,27 @@
         "--manager-context-budget-tokens", "12288",
         "--active-memory-budget-tokens", "8192",
         "--update-ledger-budget-tokens", "2048",
+        "--recent-tail-budget-tokens", "16384",
+        "--max-concurrency", "1"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Memory Sidecar V2: 单条样本全流程",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "program": "${workspaceFolder}/scripts/run_memory_sidecar_strong.py",
+      "args": [
+        "--protocol", "v2",
+        "--manifest", "data/samples/longmemeval_s_eval_120_seed_20260821.csv",
+        "--run-id", "${input:sidecarV2RunId}",
+        "--question-id", "${input:sidecarV2QuestionId}",
+        "--chunk-budget-tokens", "8192",
+        "--manager-max-tokens", "4096",
         "--recent-tail-budget-tokens", "16384",
         "--max-concurrency", "1"
       ],

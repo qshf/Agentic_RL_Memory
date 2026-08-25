@@ -24,6 +24,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from memory_sidecar.process import process_one  # noqa: E402
+from memory_sidecar.process_v2 import process_one_v2  # noqa: E402
 from utils.client import QwenClient  # noqa: E402
 from utils.config import (  # noqa: E402
     DEFAULT_BASE_URL,
@@ -45,6 +46,7 @@ DEFAULT_MANIFEST = ROOT / "data" / "samples" / "longmemeval_s_eval_120_seed_2026
 DEFAULT_SOURCE = ROOT / "data" / "official_longmemeval" / "longmemeval_s_cleaned.json"
 TAIL_BUDGET_TOKENS = 16 * 1024
 PROMPT_VERSION = "memory-sidecar-strong-v1-json-events"
+V2_PROMPT_VERSION = "memory-sidecar-v2-atomic-expense-repair"
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,9 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-run-id", default="rolling-summary-eval120-v1-atomic-c2")
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--run-id", default="sidecar-strong-pilot-v1")
+    parser.add_argument("--protocol", choices=("v1", "v2"), default="v1")
     parser.add_argument("--limit", type=int, default=24)
     parser.add_argument("--question-id", nargs="*", default=None)
-    parser.add_argument("--chunk-budget-tokens", type=int, default=2048)
+    parser.add_argument("--chunk-budget-tokens", type=int, default=None,
+                        help="V1 default 2048; V2 default 8192. Never splits a complete turn.")
     parser.add_argument("--manager-context-budget-tokens", type=int, default=12288)
     parser.add_argument("--active-memory-budget-tokens", type=int, default=8192)
     parser.add_argument("--update-ledger-budget-tokens", type=int, default=2048)
@@ -67,7 +71,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--recent-tail-budget-tokens", type=int, default=TAIL_BUDGET_TOKENS)
     parser.add_argument("--max-concurrency", type=int, default=1)
-    parser.add_argument("--manager-max-tokens", type=int, default=768)
+    parser.add_argument("--manager-max-tokens", type=int, default=None,
+                        help="V1 default 768; V2 default 4096.")
     parser.add_argument("--answer-max-tokens", type=int, default=1024)
     parser.add_argument("--base-url", default=os.environ.get("QWEN38_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--model", default=os.environ.get("QWEN38_MODEL", DEFAULT_MODEL))
@@ -82,6 +87,14 @@ def _api_key_from_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is not set; the key must never be committed")
     return value
+
+
+def apply_protocol_defaults(args: argparse.Namespace) -> None:
+    """Apply protocol-specific budgets only when the caller did not override them."""
+    if args.chunk_budget_tokens is None:
+        args.chunk_budget_tokens = 2048 if args.protocol == "v1" else 8192
+    if args.manager_max_tokens is None:
+        args.manager_max_tokens = 768 if args.protocol == "v1" else 4096
 
 
 def _select_manifest(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -110,8 +123,9 @@ def _model(args: argparse.Namespace) -> ModelConfig:
 
 def _run_config(args: argparse.Namespace, model: ModelConfig, preflight: dict[str, Any]) -> dict[str, Any]:
     payload = {
-        "method": "memory_sidecar_strong",
-        "prompt_version": PROMPT_VERSION,
+        "method": "memory_sidecar_strong" if args.protocol == "v1" else "memory_sidecar_v2",
+        "prompt_version": PROMPT_VERSION if args.protocol == "v1" else V2_PROMPT_VERSION,
+        "protocol": args.protocol,
         "model": asdict(model),
         "chunk_budget_tokens": args.chunk_budget_tokens,
         "manager_context_budget_tokens": args.manager_context_budget_tokens,
@@ -137,6 +151,7 @@ def _run_config(args: argparse.Namespace, model: ModelConfig, preflight: dict[st
 
 def main() -> None:
     args = parse_args()
+    apply_protocol_defaults(args)
     if args.chunk_budget_tokens < 1 or args.manager_context_budget_tokens < 1 or args.max_concurrency < 1:
         raise SystemExit("token budgets and --max-concurrency must be >= 1")
     if not args.baseline_db.exists():
@@ -157,6 +172,7 @@ def main() -> None:
     probe_client = QwenClient(model, api_key)
     preflight = probe_client.preflight()
     config = _run_config(args, model, preflight)
+    worker = process_one if args.protocol == "v1" else process_one_v2
 
     run_dir = args.results_root / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -172,7 +188,7 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=args.max_concurrency) as executor:
         futures = {
             executor.submit(
-                process_one,
+                worker,
                 source[item["question_id"]],
                 args=args,
                 config=config,
@@ -191,7 +207,7 @@ def main() -> None:
     wall_ms = int((time.monotonic() - started) * 1000)
     statistics.update({
         "run_id": args.run_id,
-        "method": "memory_sidecar_strong",
+        "method": config["method"],
         "config_fingerprint": config["config_fingerprint"],
         "hypotheses_exported": exported,
         "execution": {
