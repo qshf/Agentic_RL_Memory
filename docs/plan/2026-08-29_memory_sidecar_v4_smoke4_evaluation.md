@@ -100,3 +100,25 @@ amount=150 USD; provider=thrive market; time=last month
 DeepSeek `deepseek-v4-pro` 按官方 rubric 评测：`graph-all=3/4 (0.75)`，`numeric-all=1/4 (0.25)`。因此 numeric projection 不能替代全图上下文；后续 V5 只能在问题类型和上下文中都检测到“数值聚合意图”时启用，并保留非数值事实的最小投影。
 
 本次 numeric 回放曾以两个进程并发写同一 SQLite，首轮出现一次 `database is locked`。已将 `TrajectoryStore` 的连接 timeout/busy timeout 提高到 60 秒；补跑后四条 projection 均成功落库。并发实验应继续使用不同 sample 分片，避免多个 worker 写同一 sample。
+
+## 24 条 pilot 结果（2026-08-29）
+
+在上述优化后，24 条冻结 pilot 使用 `chunk=2048`、V1 Answer prompt、16K raw tail 和 `graph-all` 重新运行。为控制执行时间，分成两个各 12 条的独立 SQLite shard 并发运行，目录为：
+
+- `results/memory_sidecar/sidecar-v4-pilot24-shard1-20260829/`
+- `results/memory_sidecar/sidecar-v4-pilot24-shard2-20260829/`
+
+两路共 24/24 sample completed，无 sample 级失败。DeepSeek `deepseek-v4-pro` judge 结果为 **12/24（50.00%）**，按题型统计如下：
+
+| question_type | correct | total | accuracy |
+|---|---:|---:|---:|
+| `knowledge-update` | 2 | 4 | 50.00% |
+| `multi-session` | 4 | 10 | 40.00% |
+| `single-session-assistant` | 2 | 2 | 100.00% |
+| `single-session-preference` | 1 | 4 | 25.00% |
+| `single-session-user` | 2 | 2 | 100.00% |
+| `temporal-reasoning` | 1 | 2 | 50.00% |
+
+与 V3 2048 `summary-off` 的 `12/24 (50.00%)` 相比，V4 当前是持平，不足以证明图谱表示带来准确率提升。优化确实降低了 Manager 状态输入膨胀，并修复了相对时间解析和部分 occurrence 合并，但 Answer 仍会在全图中混淆 provider、计划/观察与真实购买。
+
+因此下一步不应直接扩大到 120 条。应先针对 24 条失败轨迹增加 query-aware 的程序投影：数值比较只保留 `PURCHASED` occurrence，时间问题同时保留 `TARGET/PREFERS/OBSERVED`，并将无法可靠归属 provider 的金额显式标为 unknown，禁止 Answer 把它归因到邻近商店。该投影应作为 V5 独立实验臂，继续保留 V4 graph-all 对照。
