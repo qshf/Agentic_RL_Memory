@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from memory_sidecar.process import process_one  # noqa: E402
 from memory_sidecar.process_v2 import process_one_v2  # noqa: E402
+from memory_sidecar.process_v3 import process_one_v3  # noqa: E402
 from utils.client import QwenClient  # noqa: E402
 from utils.config import (  # noqa: E402
     DEFAULT_BASE_URL,
@@ -47,6 +48,7 @@ DEFAULT_SOURCE = ROOT / "data" / "official_longmemeval" / "longmemeval_s_cleaned
 TAIL_BUDGET_TOKENS = 16 * 1024
 PROMPT_VERSION = "memory-sidecar-strong-v1-json-events"
 V2_PROMPT_VERSION = "memory-sidecar-v2-atomic-expense-repair"
+V3_PROMPT_VERSION = "memory-sidecar-v3-multi-event-atomic-batch"
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,11 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-run-id", default="rolling-summary-eval120-v1-atomic-c2")
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT)
     parser.add_argument("--run-id", default="sidecar-strong-pilot-v1")
-    parser.add_argument("--protocol", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--protocol", choices=("v1", "v2", "v3"), default="v1")
     parser.add_argument("--limit", type=int, default=24)
     parser.add_argument("--question-id", nargs="*", default=None)
     parser.add_argument("--chunk-budget-tokens", type=int, default=None,
-                        help="V1 default 2048; V2 default 8192. Never splits a complete turn.")
+                        help="V1 default 2048; V2/V3 default 8192. Never splits a complete turn.")
     parser.add_argument("--manager-context-budget-tokens", type=int, default=12288)
     parser.add_argument("--active-memory-budget-tokens", type=int, default=8192)
     parser.add_argument("--update-ledger-budget-tokens", type=int, default=2048)
@@ -70,10 +72,29 @@ def parse_args() -> argparse.Namespace:
         help="仅调试：处理 N 个 manager chunk 后，用部分状态回答；0 表示全部处理",
     )
     parser.add_argument("--recent-tail-budget-tokens", type=int, default=TAIL_BUDGET_TOKENS)
+    parser.add_argument("--shared-context-budget-tokens", type=int, default=80 * 1024,
+                        help="V3 Answer shared current-memory + recent-tail budget; rolling baseline default is 80K.")
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--manager-max-tokens", type=int, default=None,
-                        help="V1 default 768; V2 default 4096.")
+                        help="V1 default 768; V2/V3 default 4096.")
     parser.add_argument("--answer-max-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--compactor", choices=("off", "on", "reuse"), default="off",
+        help="V3 only: off uses current memory + raw tail; on creates a final summary; reuse loads a saved summary.",
+    )
+    parser.add_argument("--compactor-max-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--compaction-run-id", default=None,
+        help="Logical ID for final-summary snapshots; defaults to --run-id. Required to select a reused snapshot.",
+    )
+    parser.add_argument("--compaction-source-db", type=Path, default=None,
+                        help="SQLite file containing saved final summaries when --compactor reuse.")
+    parser.add_argument("--compaction-source-run-id", default=None,
+                        help="Source run ID containing saved final summaries when --compactor reuse.")
+    parser.add_argument("--replay-source-db", type=Path, default=None,
+                        help="Reuse canonical V3 memory from this SQLite file; skips all Manager calls.")
+    parser.add_argument("--replay-source-run-id", default=None,
+                        help="Source run ID containing canonical V3 memory for Answer-only replay.")
     parser.add_argument("--base-url", default=os.environ.get("QWEN38_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--model", default=os.environ.get("QWEN38_MODEL", DEFAULT_MODEL))
     parser.add_argument("--api-key-env", default="QWEN38_API_KEY")
@@ -123,8 +144,8 @@ def _model(args: argparse.Namespace) -> ModelConfig:
 
 def _run_config(args: argparse.Namespace, model: ModelConfig, preflight: dict[str, Any]) -> dict[str, Any]:
     payload = {
-        "method": "memory_sidecar_strong" if args.protocol == "v1" else "memory_sidecar_v2",
-        "prompt_version": PROMPT_VERSION if args.protocol == "v1" else V2_PROMPT_VERSION,
+        "method": {"v1": "memory_sidecar_strong", "v2": "memory_sidecar_v2", "v3": "memory_sidecar_v3"}[args.protocol],
+        "prompt_version": {"v1": PROMPT_VERSION, "v2": V2_PROMPT_VERSION, "v3": V3_PROMPT_VERSION}[args.protocol],
         "protocol": args.protocol,
         "model": asdict(model),
         "chunk_budget_tokens": args.chunk_budget_tokens,
@@ -133,6 +154,14 @@ def _run_config(args: argparse.Namespace, model: ModelConfig, preflight: dict[st
         "update_ledger_budget_tokens": args.update_ledger_budget_tokens,
         "debug_max_chunks": args.debug_max_chunks,
         "recent_tail_budget_tokens": args.recent_tail_budget_tokens,
+        "shared_context_budget_tokens": args.shared_context_budget_tokens,
+        "compactor": args.compactor,
+        "compactor_max_tokens": args.compactor_max_tokens,
+        "compaction_run_id": args.compaction_run_id or args.run_id,
+        "compaction_source_db": str(args.compaction_source_db) if args.compaction_source_db else None,
+        "compaction_source_run_id": args.compaction_source_run_id,
+        "replay_source_db": str(args.replay_source_db) if args.replay_source_db else None,
+        "replay_source_run_id": args.replay_source_run_id,
         "baseline_db": str(args.baseline_db),
         "baseline_run_id": args.baseline_run_id,
         "tokenizer_path": str(args.tokenizer_path) if args.tokenizer_path else None,
@@ -152,8 +181,15 @@ def _run_config(args: argparse.Namespace, model: ModelConfig, preflight: dict[st
 def main() -> None:
     args = parse_args()
     apply_protocol_defaults(args)
-    if args.chunk_budget_tokens < 1 or args.manager_context_budget_tokens < 1 or args.max_concurrency < 1:
+    if (args.chunk_budget_tokens < 1 or args.manager_context_budget_tokens < 1
+            or args.shared_context_budget_tokens < 1 or args.compactor_max_tokens < 1 or args.max_concurrency < 1):
         raise SystemExit("token budgets and --max-concurrency must be >= 1")
+    if args.compactor != "off" and args.protocol != "v3":
+        raise SystemExit("--compactor is supported only with --protocol v3")
+    if args.compactor == "reuse" and (args.compaction_source_db is None or not args.compaction_source_run_id):
+        raise SystemExit("--compactor reuse requires --compaction-source-db and --compaction-source-run-id")
+    if (args.replay_source_db is None) != (args.replay_source_run_id is None):
+        raise SystemExit("Answer-only replay requires both --replay-source-db and --replay-source-run-id")
     if not args.baseline_db.exists():
         raise SystemExit(f"baseline database not found: {args.baseline_db}")
     manifest = _select_manifest(args)
@@ -172,7 +208,7 @@ def main() -> None:
     probe_client = QwenClient(model, api_key)
     preflight = probe_client.preflight()
     config = _run_config(args, model, preflight)
-    worker = process_one if args.protocol == "v1" else process_one_v2
+    worker = {"v1": process_one, "v2": process_one_v2, "v3": process_one_v3}[args.protocol]
 
     run_dir = args.results_root / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)

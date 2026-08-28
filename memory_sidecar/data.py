@@ -58,6 +58,7 @@ def load_baseline_tail(
             (sample_id,),
         ).fetchall()
         tail_parts: list[str] = []
+        tail_blocks: list[dict[str, Any]] = []
         source_ordinals: list[int] = []
         # 最后一次 V1 compression 的 cut 定义仍可见的近期 tail；cut 之前（含 cut）的
         # ingest 行刻意排除。
@@ -66,6 +67,7 @@ def load_baseline_tail(
             ordinal = int(detail.get("unit_ordinal", -1))
             if ordinal > cut_index and row["raw_text"]:
                 tail_parts.append(row["raw_text"])
+                tail_blocks.append({"unit_ordinal": ordinal, "text": row["raw_text"]})
                 source_ordinals.append(ordinal)
         full_tail = "\n".join(tail_parts)
         full_tail_tokens = tokenizer.count(full_tail)
@@ -88,6 +90,9 @@ def load_baseline_tail(
             "raw_tail_full_tokens": full_tail_tokens,
             "raw_tail_trimmed": trimmed,
             "tail_source_ordinals": source_ordinals,
+            # V3 uses these in-memory blocks to trim at complete user/assistant
+            # turns. They are intentionally not copied into sidecar SQLite.
+            "raw_tail_blocks": tail_blocks,
         }
     finally:
         connection.close()
