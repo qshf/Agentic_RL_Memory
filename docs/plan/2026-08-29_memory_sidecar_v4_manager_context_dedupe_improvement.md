@@ -11,6 +11,10 @@
 
 本方案不引入 embedding、实体模糊匹配、全局 LLM reconciliation 或新的 alias 表。它验证的是：同样的 64 条 edge 预算下，分层展示是否比单一的“词面相关度后按新近度”排序更能帮助 Manager 在跨 chunk 抽取时保持稳定。
 
+### 2026-08-29 评审修订
+
+本节以下规则优先于本文早期的简写示例。实现必须先完成 evidence role 校验、schema migration 和 replay API，再进入 LLM smoke；现有只覆盖旧 `edges/truncated` 协议的测试不能作为本方案通过依据。
+
 ## 2. 已观察到的问题
 
 `bf659f65` 的在线轨迹说明，扩大单层 Manager 图谱窗口不能直接改善抽取质量。
@@ -85,7 +89,7 @@ attributes.location
 5. edge 的插入顺序倒序；
 6. `edge_id` 升序作为最终稳定 tie-breaker。
 
-只要第 1 至 3 项任一项大于零，edge 才能进入 `relevant_edges`。无法从当前 user evidence 得到有效实体词时，`relevant_edges=[]`，全部使用 `recent_edges`；不能回退到 assistant 文本或问题文本。
+只要第 1 至 3 项任一项大于零，edge 才能进入 `relevant_edges`。无法从当前 user evidence 得到有效实体词时，`relevant_edges=[]`，全部使用 `recent_edges`；不能回退到 assistant 文本或问题文本。这里的 `current_text` 只允许从 `role=user` 的 evidence 拼接；若没有 user evidence，query terms 为空，而不是把完整 chunk 当作匹配文本。
 
 ### 4.3 输出结构
 
@@ -117,7 +121,20 @@ Manager 看到的 JSON 改为显式分层，不再输出单个混合 `edges` 数
 
 渲染顺序固定为 `relevant_edges` 再 `recent_edges`。每层内部使用上述稳定排序，不能依赖 Python 容器的偶然顺序。edge 内容继续仅含 compact 字段：subject、predicate、object、status、amount/currency/count/provider/location、解析成功的 time/scope；不新增 evidence 全文、claim_text、alias 列表或 model response。
 
-### 4.4 不改变的模型约束
+### 4.4 Schema migration
+
+这是一次原子协议迁移，不能让调用方同时猜测新旧字段。`render_v4_manager_state()`、`manager_v4_messages()`、`run_v4_e2e.py`、`run_v4_claim_smoke.py`、`replay_v4_graph_answer.py` 和相关测试必须在同一个提交中切换到以下字段：
+
+```text
+relevant_edges, recent_edges
+relevant_edge_count, recent_edge_count
+relevant_edge_truncated, recent_edge_truncated
+manager_graph_edge_budget
+```
+
+旧的 `edges`、`truncated` 不再作为 Manager 协议字段。batch 审计可额外保存 `manager_context_schema="v4.1"`，但不能用旧字段驱动逻辑。runner 和 smoke 的 `--manager-graph-max-edges` 默认值统一改为 `64`；所有离线 replay 也显式写入该参数。测试必须断言新字段，而不是仅修改断言路径后继续验证旧语义。
+
+### 4.5 不改变的模型约束
 
 Manager prompt 继续声明：历史 graph reference 是程序规范化结果，**不得没有当前 evidence 就复制历史事实**。它仍只输出：
 
@@ -149,28 +166,55 @@ Manager claim
 
 分层 Manager context 不能改变上述任一步。尤其 router 必须遍历完整 active graph，而不是 `relevant_edges + recent_edges`。
 
-### 5.2 精确去重
+### 5.2 Evidence role 与可选字段约束
 
-对于 `PURCHASED`、`ATTENDED`、`COMPLETED`、`OBSERVED_WAKE_TIME`、`MENTIONS` 等 occurrence predicate，程序仅在至少存在一个上下文 discriminator 时生成 `occurrence_key`：
+`evidence_ids` 的校验不是“ID 存在”就算通过。每个 ID 必须存在于当前 `CompiledEvidence`，且 `compiled.evidence[id].role == "user"`；assistant、system、question 或 unknown role 一律使 claim 进入 `incomplete` quarantine，不进入 graph。
+
+`claim_text` 和每个 hint 都不能成为模型绕过 evidence 的第二事实通道：
+
+1. `claim_text` 若存在，必须是所引用 user evidence 内容的严格子串；否则丢弃该字段并记录 `invalid_claim_text_hint`，raw claim 回退到 evidence 原文；
+2. `hints.amount_text`、`count_text`、`time_text`、`provider_text`、`location_text`、`scope_text` 若存在，必须分别是所引用 user evidence 拼接文本的严格子串；
+3. 未通过子串校验的 hint 不参与 `_parse_attributes()`、`_parse_time()` 或 scope 规范化，只保留在 model audit 中；
+4. 正规化的金额、时间、provider、location 和 scope 只能来自 user evidence 原文，或来自程序明确记录的格式转换。
+
+这样可以保证“当前 user evidence 是事实来源”成为程序约束，而不只是 prompt 要求。
+
+### 5.3 精确去重与同日优先级
+
+对于 `PURCHASED`、`ATTENDED`、`COMPLETED`、`OBSERVED_WAKE_TIME`、`MENTIONS` 等 occurrence predicate，先执行“是否可安全判定 occurrence”的判定，再计算 key。**ambiguous 判定优先于 exact key 合并**，解决同日两次同类事件字段完全相同的冲突。
+
+唯一的 canonical serializer 为：
 
 ```text
-subject + predicate + canonical_object
-+ normalized_time
-+ normalized_provider
-+ normalized_location
-+ normalized_scope
+canonical_json({
+  subject,
+  predicate,
+  canonical_object,
+  time: {value, granularity, interval_end, recurrence},
+  provider,
+  location,
+  scope
+})
 ```
 
-`claim_text`、evidence quote、chunk ordinal、模型自由文本 hash 均不得进入 key。
+predicate 先经过唯一 alias 表归一化；`observed_wake_time`、`observed wake time` 等输入统一为 `OBSERVED_WAKE_TIME`。时间 key 必须包含 `value`、`granularity`、`interval_end` 和 `recurrence`；scope 使用规范化值及 parse status。`claim_text`、evidence quote、chunk ordinal、模型自由文本 hash 均不得进入 key。
 
-完整 key 相同的 edge 视为同一 occurrence：
+discriminator 规则如下：
+
+1. 精确到 timestamp 的时间，或具有明确开始/结束区间且同时有 provider/location/scope 之一时，可作为强 discriminator；
+2. 只有 day 粒度日期，且 predicate 属于可重复事件时，不能单独证明同日只有一个 occurrence；
+3. 只有 provider/location/scope 而没有时间时，可以生成候选 key，但若同一 subject/predicate/object/context 已存在于不同 source unit，必须先标记 ambiguous；
+4. 没有任何 discriminator 时不生成 key；
+5. 同一 source unit 的重复 extraction，或后续 claim 明确补全同一 source unit 的字段，可以合并；不同 source unit 的 day-only 同 key claim 默认追加。
+
+只有通过上述判定的完整 key 相同 edge 才视为同一 occurrence：
 
 1. 合并新增的非空 amount、currency、count、provider、location、time、scope；
 2. 合并去重后的 `source_refs` 和 `normalization_actions`；
 3. 已有字段与新字段冲突时，保留原值，并把新值追加到 `attribute_conflicts`；
 4. 返回 `deduplicated` 或 `deduplicated_merged`，不创建第二条 edge。
 
-### 5.3 受限的对象表述修复
+### 5.4 受限的对象表述修复
 
 精确 key 不同但可能是同一模型抽取时，只允许现有的严格 `provider suffix` 合并。必须同时满足：
 
@@ -181,12 +225,12 @@ subject + predicate + canonical_object
 
 命中时返回 `deduplicated_alias` 或 `deduplicated_alias_merged`，并在 route result 中记录命中规则 `provider_suffix_same_source`。不扩大为编辑距离、语义相似度或跨 session 模糊合并。
 
-### 5.4 不确定时追加
+### 5.5 不确定时追加
 
 出现下列任一情况时，不合并：
 
 - time/provider/location/scope 全部缺失，无法生成 occurrence key；
-- 同日可能有两次同类购买或完成事件，但原文没有实例区分字段；
+- 仅有 day 粒度日期，且同一规范化事实来自不同 source unit，无法证明是同一次事件；
 - object 不同，且不满足受限 provider suffix 规则；
 - 数量、金额、时间或 provider 冲突且不能解释为“后续补全”；
 - evidence 相距较远，无法证明是同一 source event。
@@ -207,7 +251,7 @@ manager_context
 route_result
   route_status
   occurrence_key_present
-  dedupe_rule: exact_key | provider_suffix_same_source | null
+  dedupe_rule: exact_key | provider_suffix_same_source | ambiguous_day | null
   merged_fields
   attribute_conflicts
 ```
@@ -219,17 +263,20 @@ route_result
 3. 相同 state 与 evidence 的 renderer 输出字节级一致；
 4. 增加第 65 条无关 edge 不会挤掉已命中的相关 edge；
 5. 完整 occurrence key 相同会合并 provenance 和缺失字段；
-6. 同一日两次同类事件且无实例 discriminator 时不合并；
+6. 同一 source unit 的 day-only 重复会合并，不同 source unit 的 day-only 同 key 会以 `ambiguous_day` 追加；
 7. provider suffix 合并只在同 source 或相邻 unit 的严格条件下触发；
-8. Manager context 只保留 64 条时，router 仍可与第 200 条 active edge 做精确去重。
+8. assistant evidence、非子串 claim_text/hints 不得进入 normalization；
+9. Manager context 只保留 64 条时，router 仍可与第 200 条 active edge 做精确去重。
 
 SQLite 轨迹中每个 batch 的 `memory_before_json.manager_context` 必须保存分层上下文快照。这样可以区分“Manager 没看到相关旧 edge”和“Manager 看到了但仍抽取异常”。
 
 ## 7. 验证顺序与通过条件
 
-### Phase 1：离线 renderer/router 回归
+### Phase 1：离线 renderer/router/replay 回归
 
-不调用 LLM。使用已有 V4 trajectory 重放，确认分层上下文稳定、总 edge 不超过 64、occurrence 路由结果不因 context cap 改变。
+不调用 LLM。使用已有 V4 trajectory 的 `sidecar_v4_batches.raw_response` 和 `input_text` 作为 replay 输入，按 batch ordinal 重新执行 parser、normalizer 和 router；不从 `sidecar_v4_edges` 当前状态反推历史。每个 batch 的 `memory_before_json` 作为首次状态快照校验，replay 输出写入独立 SQLite run。确认分层上下文稳定、总 edge 不超过 64、occurrence 路由结果不因 context cap 改变。
+
+实现最小 `replay_v4_manager_batches(source_db, source_run_id, target_db, target_run_id)` API：按 sample、batch ordinal 顺序读取 raw response，重建 state，复用同一 compiled evidence；对 offline smoke 中缺失完整前状态的旧记录，标记 `replay_status=unavailable`，不得声称 replay 通过。新的 smoke batch 必须保存完整 `memory_before_json` 和 raw response。
 
 ### Phase 2：四条 Manager smoke
 
@@ -246,7 +293,8 @@ SQLite 轨迹中每个 batch 的 `memory_before_json.manager_context` 必须保�
 2. 完整 graph 和 SQLite 重放的 edge 集合一致；
 3. 已命中当前 user evidence 的相关 edge 不会因 recent edge 填充而被挤出；
 4. exact/provider-suffix 以外的重复候选保持追加，不出现静默跨事件合并；
-5. Manager 平均输入不高于当前 64 条单层实现的同样本基线约 3,899 tokens 的 5%。
+5. Manager 平均输入不高于当前 64 条单层实现的同样本基线约 3,899 tokens 的 5%；
+6. 与单层 64 baseline 做逐 chunk 配对记录：`relevant_recall`、`false_positive_rate`、`exact_route_precision`、`ambiguous_route_precision`。这些是实现回归指标，不改变 Answer projection 或引入新的模型调用。
 
 完成四条 smoke 后再决定是否运行 24 条。此次改动不改变 Answer projection，因此不将 Answer 的对错当作分层 Manager context 是否通过的唯一依据。
 
@@ -257,7 +305,7 @@ SQLite 轨迹中每个 batch 的 `memory_before_json.manager_context` 必须保�
 1. Answer 的 event-count、sum/rank 或 query-specific projection；
 2. entity alias 索引、embedding 召回和模糊实体链接；
 3. unknown/raw claim 的新投影规则；
-4. 新的 Manager 质量指标、统计显著性评估；
+4. 统计显著性评估和扩大数据集；本次只记录逐 chunk 的最小回归指标；
 5. V5 的数字/非数字混合路由。
 
 这样可以把这次实验的因果关系限制为：**分层的 64-edge Manager reference 是否改善跨 chunk 抽取参考，而程序侧 occurrence router 是否仍保持保守且可回放的去重。**
