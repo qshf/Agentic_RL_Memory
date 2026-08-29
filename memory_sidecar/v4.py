@@ -871,9 +871,11 @@ def render_v4_manager_state(
     )
 
 
-def manager_v4_messages(state: V4GraphState, compiled: CompiledEvidence) -> list[dict[str, str]]:
+def manager_v4_messages(
+    state: V4GraphState, compiled: CompiledEvidence, *, max_edges: int = 32,
+) -> list[dict[str, str]]:
     """Build a graph-aware extraction prompt; routing still owns canonical state."""
-    manager_state = render_v4_manager_state(state, current_text=compiled.text)
+    manager_state = render_v4_manager_state(state, max_edges=max_edges, current_text=compiled.text)
     system = "You extract durable facts. Return one JSON object only; never answer the final question."
     user = f"""Return exactly one JSON object: {{\"claims\":[...]}}.
 Each claim must contain only these required fields:

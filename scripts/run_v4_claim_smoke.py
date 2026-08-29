@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--run-id", default="sidecar-v4-claim-smoke-20260828")
     parser.add_argument("--chunk-budget", type=int, default=2048)
+    parser.add_argument("--manager-graph-max-edges", type=int, default=32)
     parser.add_argument("--manager-max-tokens", type=int, default=2048)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--offline", action="store_true", help="只验证真实样本的 chunk/evidence/normalizer，不调用模型")
@@ -77,14 +78,14 @@ def main() -> None:
         sample: dict[str, object] = {"question_id": question_id, "question_type": row["question_type"], "chunks": [], "edges": [], "raw_claims": [], "quarantine_claims": []}
         for chunk_ordinal, current in enumerate(chunks(tuple(stream), args.chunk_budget, tokenizer), 1):
             compiled = compile_evidence(current)
-            manager_context = render_v4_manager_state(state, current_text=compiled.text)
+            manager_context = render_v4_manager_state(state, max_edges=args.manager_graph_max_edges, current_text=compiled.text)
             chunk_result: dict[str, object] = {"chunk_ordinal": chunk_ordinal, "unit_ordinals": [message.unit_ordinal for message in current], "evidence_count": len(compiled.evidence), "evidence_chars": len(compiled.text), "manager_graph_edge_count": len(json.loads(manager_context)["edges"]), "manager_graph_truncated": json.loads(manager_context)["truncated"]}
             if args.offline:
                 store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json=json.dumps({"manager_context": json.loads(manager_context)}, ensure_ascii=False, sort_keys=True), raw_response=None, parse_status="offline", claims=[], edges=[], raw_claims=[], quarantine_claims=[])
                 sample["chunks"].append(chunk_result)
                 continue
             assert client is not None
-            response = client.chat(manager_v4_messages(state, compiled), max_tokens=args.manager_max_tokens)
+            response = client.chat(manager_v4_messages(state, compiled, max_edges=args.manager_graph_max_edges), max_tokens=args.manager_max_tokens)
             chunk_result.update({"finish_reason": response.finish_reason, "input_tokens": response.input_tokens, "output_tokens": response.output_tokens})
             try:
                 claims = parse_v4_manager_response(response.content, compiled)

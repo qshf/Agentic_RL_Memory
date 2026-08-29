@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-max-tokens", type=int, default=2048)
     parser.add_argument("--answer-max-tokens", type=int, default=1024)
     parser.add_argument("--raw-tail-budget", type=int, default=16 * 1024)
+    parser.add_argument("--manager-graph-max-edges", type=int, default=32)
     parser.add_argument(
         "--projection",
         choices=("graph-all", "numeric-all", "query-auto"),
@@ -142,14 +143,14 @@ def main() -> None:
         try:
             for chunk_ordinal, current in enumerate(chunks(tuple(stream), args.chunk_budget, tokenizer), 1):
                 compiled = compile_evidence(current)
-                manager_context = render_v4_manager_state(state, current_text=compiled.text)
+                manager_context = render_v4_manager_state(state, max_edges=args.manager_graph_max_edges, current_text=compiled.text)
                 before = json.dumps({
                     "edges": state.edges,
                     "raw_claims": state.raw_claims,
                     "manager_context": json.loads(manager_context),
                 }, ensure_ascii=False, sort_keys=True)
                 call_ordinal += 1
-                response = client.chat(manager_v4_messages(state, compiled), max_tokens=args.manager_max_tokens)
+                response = client.chat(manager_v4_messages(state, compiled, max_edges=args.manager_graph_max_edges), max_tokens=args.manager_max_tokens)
                 manager_input += response.input_tokens
                 manager_output += response.output_tokens
                 record_call(store, sample_id, call_ordinal, "sidecar_manager", response)
