@@ -144,6 +144,42 @@ def test_observed_wake_time_alias_is_canonicalized():
     assert normalized.predicate == "OBSERVED_WAKE_TIME"
 
 
+def test_uses_alias_is_canonicalized_and_prompt_allows_it():
+    compiled = _compiled()
+    claim = parse_v4_manager_response(json.dumps({"claims": [_claim(relation="uses", object_text="Scribd app")]}), compiled)[0]
+    normalized = normalize_v4_claim(claim, compiled, ordinal=0)
+    assert normalized.predicate == "USES"
+    assert "uses" in manager_v4_messages(V4GraphState(), compiled)[1]["content"]
+
+
+def test_count_parser_supports_discrete_entities_and_ignores_range_upper_bound():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user",
+        content="I own 3 plants.",
+    ), SimpleNamespace(
+        unit_ordinal=11, session_id="s", session_date="2023/05/30", role="user",
+        content="I planned a 7-10 day trip.",
+    )])
+    plant = _claim(relation="observed", object_text="3 plants", evidence_ids=[0])
+    trip = _claim(relation="plans", object_text="a 7-10 day trip", evidence_ids=[1])
+    plant_normalized = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [plant]}), compiled)[0], compiled, ordinal=0)
+    trip_normalized = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [trip]}), compiled)[0], compiled, ordinal=1)
+    assert plant_normalized.attributes["count"] == 3
+    assert trip_normalized.attributes["count"] is None
+
+
+def test_temporal_projection_keeps_observed_wake_time_without_wake_in_object():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I wake at 7:30 am.",
+    )])
+    claim = _claim(relation="observed wake time", object_text="7:30 am", evidence_ids=[0])
+    state = V4GraphState()
+    state.route(normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [claim]}), compiled)[0], compiled, ordinal=0))
+    context, meta = render_v4_query_projection(state, "What time do I wake up?")
+    assert "7:30 am" in context
+    assert meta["selected_edge_count"] == 1
+
+
 def test_relative_time_uses_evidence_session_date():
     compiled = _compiled()
     claims = parse_v4_manager_response(json.dumps({"claims": [_claim(hints={"time_text": "previous Saturday"})]}), compiled)

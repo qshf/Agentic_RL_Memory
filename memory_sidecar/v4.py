@@ -51,8 +51,10 @@ _RELATION_ALIASES = {
     "observed wake time": "OBSERVED_WAKE_TIME",
     "observed_wake_time": "OBSERVED_WAKE_TIME",
     "wake time observed": "OBSERVED_WAKE_TIME",
+    "uses": "USES",
+    "use": "USES",
 }
-_OCCURRENCE_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "OBSERVED_WAKE_TIME", "MENTIONS"})
+_OCCURRENCE_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "OBSERVED_WAKE_TIME", "MENTIONS", "USES"})
 _NUMERIC_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "OBSERVED_WAKE_TIME"})
 _GROCERY_PROVIDER_HINTS = frozenset({"walmart", "publix", "trader joe's", "thrive market", "whole foods", "kroger", "aldi", "instacart"})
 _GROCERY_OBJECT_HINTS = frozenset({"grocery", "groceries", "chicken", "beef", "produce", "organic", "food", "meals", "snacks", "pantry", "dairy", "vegetable", "fruit"})
@@ -65,7 +67,14 @@ _UPDATE_PHRASES = (
     re.compile(r"\bcorrected\b.+\bto\b", re.I),
 )
 _AMOUNT = re.compile(r"(?P<symbol>[$€£])\s*(?P<amount>\d+(?:,\d{3})*(?:\.\d{1,2})?)")
-_COUNT = re.compile(r"\b(?P<count>\d+)\s+(?:(?:[A-Za-z]+)\s+)?(?:courses?|coins?|items?|days?)\b", re.I)
+# Keep this deliberately limited to discrete-count nouns.  In particular, do
+# not match the upper bound of a range such as "7-10 days".
+_COUNT = re.compile(
+    r"(?<![\d-])\b(?P<count>\d+)\s+(?:(?:[A-Za-z]+)\s+)?"
+    r"(?:courses?|coins?|items?|days?|plants?|albums?|books?|"
+    r"graduations?|events?|trips?|nights?)\b",
+    re.I,
+)
 _MONTH_DATE = re.compile(r"\b(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})\b")
 _ISO_DATE = re.compile(r"\b(?P<year>\d{4})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})\b")
 
@@ -196,7 +205,7 @@ def normalize_v4_claim(
     if relation != predicate.lower():
         actions.append({"kind": "relation_alias", "input": claim.relation, "output": predicate})
 
-    source_text = raw_text
+    source_text = _claim_attribute_source(claim.object_text, claim.claim_text, raw_text)
     attributes, attribute_actions = _parse_attributes(source_text, claim.hints)
     actions.extend(attribute_actions)
     time_json, time_actions = _parse_time(claim.hints.get("time_text") or raw_text, claim.evidence_ids, compiled)
@@ -213,6 +222,34 @@ def normalize_v4_claim(
         claim_id, "normalized", subject, predicate, object_text, object_type, attributes, time_json, scope_json,
         refs, raw_text, update_intent, tuple(actions), claim.model_claim,
     )
+
+
+def _claim_attribute_source(object_text: str, claim_text: str | None, raw_text: str) -> str:
+    """Choose the smallest evidence span likely belonging to this claim.
+
+    A chunk can contain several facts and every claim may cite the same unit.
+    Scanning the whole unit makes the first amount/count leak into unrelated
+    claims. A validated claim_text is exact evidence; otherwise select the
+    sentence with the greatest lexical overlap with object_text. Falling back
+    to raw_text preserves recall when the model paraphrases the object.
+    """
+    if claim_text:
+        return claim_text
+    object_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", _canonical_text(object_text))
+        if len(token) >= 3
+    }
+    if not object_tokens:
+        return raw_text
+    sentences = [part.strip() for part in re.split(r"(?:[.!?]\s+|\n+)", raw_text) if part.strip()]
+    if not sentences:
+        return raw_text
+    scored = []
+    for index, sentence in enumerate(sentences):
+        tokens = set(re.findall(r"[a-z0-9]+", _canonical_text(sentence)))
+        scored.append((len(object_tokens & tokens), -index, sentence))
+    best_score, _, best_sentence = max(scored)
+    return best_sentence if best_score else raw_text
 
 
 def _parse_attributes(source_text: str, hints: Mapping[str, str | None]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -470,10 +507,15 @@ def render_v4_graph_all(state_or_edges: V4GraphState | Sequence[Mapping[str, Any
             details.append(f"location={attrs['location']}")
         time_json = edge.get("time_json") or {}
         if time_json.get("value"):
-            details.append(f"time={time_json['value']}")
+            time_value = str(time_json["value"])
+            if time_json.get("interval_end"):
+                time_value += f"..{time_json['interval_end']}"
+            details.append(f"time={time_value}")
         scope = (edge.get("scope_json") or {}).get("value")
         if scope:
             details.append(f"scope={scope}")
+        if edge.get("status") == "contradicted":
+            details.append("status=contradicted")
         details.append("sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
         lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}" + ("; " + "; ".join(details) if details else ""))
     merged_raw: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -643,13 +685,15 @@ def render_v4_query_projection(
         if "wake" in _canonical_text(question) or "bed" in _canonical_text(question):
             selected = [
                 edge for edge in selected
-                if any(token in str(edge.get("object", "")) for token in ("wake", "woke", "waking", "bed"))
+                if edge.get("predicate") == "OBSERVED_WAKE_TIME"
+                or any(token in str(edge.get("object", "")) for token in ("wake", "woke", "waking", "bed"))
             ]
         lines = ["[V4 QUERY PROJECTION] temporal", "[TARGET PREFERENCE OBSERVATION FACTS]"]
         for edge in selected:
             time_json = edge.get("time_json") or {}
             time_value = time_json.get("value") if time_json.get("parse_status") == "ok" else "unknown"
-            lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; time={time_value or 'unknown'}; interval_end={time_json.get('interval_end') or 'none'}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
+            status = "; status=contradicted" if edge.get("status") == "contradicted" else ""
+            lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; time={time_value or 'unknown'}; interval_end={time_json.get('interval_end') or 'none'}{status}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
         return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
     if kind == "count":
         selected = []
@@ -971,7 +1015,7 @@ subject_text, relation, object_text, evidence_ids.
 claim_text and hints are optional raw text. Do not output IDs, dates in ISO format,
 node types, statuses, update actions, or normalized numbers. Copy facts from the evidence;
 do not infer. The relation must be one of: bought, attended, completed, observed,
-target, prefers, plans, lives in, or mentions. Use one claim per durable user-provided
+target, prefers, plans, lives in, uses, observed wake time, or mentions. Use one claim per durable user-provided
 fact only. Do not extract questions, requests, recommendations, hypotheticals, options,
 or assistant statements. Cite only local integer evidence IDs from user statements.
 Return at most 12 claims. If there are no durable facts, return {{"claims":[]}}.
