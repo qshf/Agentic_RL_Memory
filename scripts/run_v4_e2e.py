@@ -21,6 +21,7 @@ from memory_sidecar.v4 import (
     normalize_v4_claim,
     parse_v4_manager_response,
     render_v4_graph_all,
+    render_v4_manager_state,
     render_v4_numeric_projection,
     render_v4_query_projection,
 )
@@ -141,7 +142,12 @@ def main() -> None:
         try:
             for chunk_ordinal, current in enumerate(chunks(tuple(stream), args.chunk_budget, tokenizer), 1):
                 compiled = compile_evidence(current)
-                before = json.dumps({"edges": state.edges, "raw_claims": state.raw_claims}, ensure_ascii=False, sort_keys=True)
+                manager_context = render_v4_manager_state(state)
+                before = json.dumps({
+                    "edges": state.edges,
+                    "raw_claims": state.raw_claims,
+                    "manager_context": json.loads(manager_context),
+                }, ensure_ascii=False, sort_keys=True)
                 call_ordinal += 1
                 response = client.chat(manager_v4_messages(state, compiled), max_tokens=args.manager_max_tokens)
                 manager_input += response.input_tokens
@@ -169,6 +175,8 @@ def main() -> None:
                     "routes": Counter(route.get("route_status") for route in routes),
                     "input_tokens": response.input_tokens, "output_tokens": response.output_tokens,
                     "parse_status": parse_status,
+                    "manager_graph_edge_count": len(json.loads(manager_context)["edges"]),
+                    "manager_graph_truncated": json.loads(manager_context)["truncated"],
                 })
 
             if args.projection == "graph-all":

@@ -17,6 +17,7 @@ from memory_sidecar.v4 import (
     manager_v4_messages,
     normalize_v4_claim,
     parse_v4_manager_response,
+    render_v4_manager_state,
 )
 from utils.client import QwenClient
 from utils.config import DEFAULT_BASE_URL, DEFAULT_MODEL, ModelConfig, ROOT, sha256_text
@@ -76,9 +77,10 @@ def main() -> None:
         sample: dict[str, object] = {"question_id": question_id, "question_type": row["question_type"], "chunks": [], "edges": [], "raw_claims": [], "quarantine_claims": []}
         for chunk_ordinal, current in enumerate(chunks(tuple(stream), args.chunk_budget, tokenizer), 1):
             compiled = compile_evidence(current)
-            chunk_result: dict[str, object] = {"chunk_ordinal": chunk_ordinal, "unit_ordinals": [message.unit_ordinal for message in current], "evidence_count": len(compiled.evidence), "evidence_chars": len(compiled.text)}
+            manager_context = render_v4_manager_state(state)
+            chunk_result: dict[str, object] = {"chunk_ordinal": chunk_ordinal, "unit_ordinals": [message.unit_ordinal for message in current], "evidence_count": len(compiled.evidence), "evidence_chars": len(compiled.text), "manager_graph_edge_count": len(json.loads(manager_context)["edges"]), "manager_graph_truncated": json.loads(manager_context)["truncated"]}
             if args.offline:
-                store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json="{}", raw_response=None, parse_status="offline", claims=[], edges=[], raw_claims=[], quarantine_claims=[])
+                store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json=json.dumps({"manager_context": json.loads(manager_context)}, ensure_ascii=False, sort_keys=True), raw_response=None, parse_status="offline", claims=[], edges=[], raw_claims=[], quarantine_claims=[])
                 sample["chunks"].append(chunk_result)
                 continue
             assert client is not None
@@ -88,7 +90,7 @@ def main() -> None:
                 claims = parse_v4_manager_response(response.content, compiled)
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 chunk_result["parse_error"] = f"{type(exc).__name__}: {exc}"
-                store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json="{}", raw_response=response.content, parse_status="parse_error", claims=[], edges=state.edges, raw_claims=state.raw_claims, quarantine_claims=state.quarantine_claims)
+                store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json=json.dumps({"manager_context": json.loads(manager_context)}, ensure_ascii=False, sort_keys=True), raw_response=response.content, parse_status="parse_error", claims=[], edges=state.edges, raw_claims=state.raw_claims, quarantine_claims=state.quarantine_claims)
                 sample["chunks"].append(chunk_result)
                 continue
             normalized = [normalize_v4_claim(claim, compiled, ordinal=index) for index, claim in enumerate(claims)]
@@ -96,7 +98,7 @@ def main() -> None:
             claim_rows = []
             for claim, route in zip(normalized, routes, strict=True):
                 claim_rows.append({"claim_id": claim.claim_id, "model_claim": claim.model_claim, "normalized_claim": {"parse_status": claim.parse_status, "predicate": claim.predicate, "object": claim.object, "attributes": claim.attributes, "time_json": claim.time_json, "scope_json": claim.scope_json}, "parse_status": claim.parse_status, "route_status": route["route_status"], "route_result": route, "source_refs": list(claim.source_refs), "normalization_actions": list(claim.normalization_actions)})
-            store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json="{}", raw_response=response.content, parse_status="ok", claims=claim_rows, edges=state.edges, raw_claims=state.raw_claims, quarantine_claims=state.quarantine_claims)
+            store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json=json.dumps({"manager_context": json.loads(manager_context)}, ensure_ascii=False, sort_keys=True), raw_response=response.content, parse_status="ok", claims=claim_rows, edges=state.edges, raw_claims=state.raw_claims, quarantine_claims=state.quarantine_claims)
             chunk_result["claim_statuses"] = [claim.parse_status for claim in normalized]
             chunk_result["route_statuses"] = [route["route_status"] for route in routes]
             sample["chunks"].append(chunk_result)

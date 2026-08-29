@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 
 from memory_sidecar.v3 import compile_evidence
-from memory_sidecar.v4 import V4GraphState, classify_v4_question, manager_v4_messages, normalize_v4_claim, parse_v4_manager_response, render_v4_graph_all, render_v4_numeric_projection, render_v4_query_projection
+from memory_sidecar.v4 import V4GraphState, classify_v4_question, manager_v4_messages, normalize_v4_claim, parse_v4_manager_response, render_v4_graph_all, render_v4_manager_state, render_v4_numeric_projection, render_v4_query_projection
 from utils.store import TrajectoryStore
 
 
@@ -302,12 +302,42 @@ def test_question_classifier_routes_total_expenses_to_amount_projection():
     assert classify_v4_question("How much total money have I spent on bike-related expenses since the start of the year?") == "amount_total"
 
 
+def test_manager_prompt_includes_bounded_existing_graph_reference():
+    compiled = _compiled()
+    state = V4GraphState(edges=[
+        {
+            "edge_id": "edge-1", "occurrence_key": "occ-1", "status": "completed",
+            "subject": "user", "predicate": "PURCHASED", "object": "bike chain",
+            "attributes": {"amount": 25.0, "currency": "USD"}, "source_refs": [],
+        },
+    ])
+    prompt = manager_v4_messages(state, compiled)[1]["content"]
+    assert "Existing graph reference" in prompt
+    assert '"object":"bike chain"' in prompt
+    assert "Current chunk evidence" in prompt
+
+
+def test_manager_state_caps_edges_and_keeps_truncation_marker():
+    state = V4GraphState(edges=[
+        {
+            "edge_id": f"edge-{index}", "occurrence_key": f"occ-{index}", "status": "completed",
+            "subject": "user", "predicate": "PURCHASED", "object": f"item-{index}",
+            "attributes": {}, "source_refs": [],
+        }
+        for index in range(3)
+    ])
+    rendered = json.loads(render_v4_manager_state(state, max_edges=2, max_raw_claims=0))
+    assert len(rendered["edges"]) == 2
+    assert rendered["truncated"] is True
+    assert rendered["active_edge_count"] == 3
+
+
 def test_manager_prompt_does_not_embed_growing_graph_state():
     prompt = manager_v4_messages(
         V4GraphState(edges=[{"edge_id": "old", "object": "must not enter the prompt"}]),
         _compiled(),
     )
-    assert "must not enter the prompt" not in prompt[1]["content"]
+    assert "must not enter the prompt" in prompt[1]["content"]
     assert "Do not extract questions" in prompt[1]["content"]
 
 

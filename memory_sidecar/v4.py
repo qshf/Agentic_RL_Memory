@@ -795,17 +795,71 @@ def _claim_audit(claim: NormalizedV4Claim) -> dict[str, Any]:
     }
 
 
-def render_v4_manager_state(state: V4GraphState) -> str:
-    """Render only current normalized edges plus low-priority raw claims."""
+def render_v4_manager_state(
+    state: V4GraphState, *, max_edges: int = 32, max_raw_claims: int = 8,
+) -> str:
+    """Render a bounded graph view for the next extraction call.
+
+    The complete graph remains in the state/database for routing and audit. The
+    Manager only needs a compact reference for aliases and explicit updates; an
+    unbounded graph would recreate V3's growing prompt problem.
+    """
+    if max_edges < 0 or max_raw_claims < 0:
+        raise ValueError("manager graph limits must be non-negative")
+    active_edges = [edge for edge in state.edges if edge.get("status") != "superseded"]
+    # Keep the most recently routed edges. Functional edges are moved to the
+    # front so a current value is not hidden by a long occurrence history.
+    functional = [edge for edge in active_edges if edge.get("occurrence_key") is None]
+    occurrences = [edge for edge in active_edges if edge.get("occurrence_key") is not None]
+    if max_edges:
+        # Keep functional state first, then fill remaining slots with newest
+        # occurrences. This preserves update targets even when history is long.
+        functional_view = functional[-max_edges:]
+        remaining = max_edges - len(functional_view)
+        selected_edges = functional_view + (occurrences[-remaining:] if remaining else [])
+    else:
+        selected_edges = []
+    def compact_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
+        attributes = edge.get("attributes") or {}
+        time_json = edge.get("time_json") or {}
+        scope_json = edge.get("scope_json") or {}
+        return {
+            "subject": edge.get("subject"),
+            "predicate": edge.get("predicate"),
+            "object": edge.get("object"),
+            "status": edge.get("status"),
+            "attributes": {
+                key: attributes.get(key)
+                for key in ("amount", "currency", "count", "provider", "location")
+                if attributes.get(key) is not None
+            },
+            "time": time_json.get("value") if time_json.get("parse_status") == "ok" else None,
+            "scope": scope_json.get("value") if scope_json.get("parse_status") == "ok" else None,
+        }
+
+    def compact_raw_claim(claim: Mapping[str, Any]) -> dict[str, Any]:
+        model_claim = claim.get("model_claim") if isinstance(claim.get("model_claim"), Mapping) else {}
+        return {
+            "subject": model_claim.get("subject_text") or model_claim.get("subject"),
+            "relation": model_claim.get("relation") or model_claim.get("predicate"),
+            "object": model_claim.get("object_text") or model_claim.get("object"),
+        }
+
     return json.dumps(
-        {"version": 4, "edges": state.edges, "raw_claims": state.raw_claims[-64:]},
+        {
+            "version": 4,
+            "edges": [compact_edge(edge) for edge in selected_edges],
+            "raw_claims": [compact_raw_claim(claim) for claim in state.raw_claims[-max_raw_claims:]] if max_raw_claims else [],
+            "truncated": len(selected_edges) < len(active_edges) or len(state.raw_claims) > max_raw_claims,
+            "active_edge_count": len(active_edges),
+        },
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
 
 
 def manager_v4_messages(state: V4GraphState, compiled: CompiledEvidence) -> list[dict[str, str]]:
-    """Build a stateless extraction prompt; routing owns duplicate awareness."""
-    del state
+    """Build a graph-aware extraction prompt; routing still owns canonical state."""
+    manager_state = render_v4_manager_state(state)
     system = "You extract durable facts. Return one JSON object only; never answer the final question."
     user = f"""Return exactly one JSON object: {{\"claims\":[...]}}.
 Each claim must contain only these required fields:
@@ -822,6 +876,9 @@ optional hint to a short literal span from the evidence.
 
 Optional hints may contain amount_text, count_text, time_text, provider_text,
 location_text, or scope_text. If uncertain, omit the hint.
+
+# Existing graph reference (program-normalized; do not copy facts without current evidence)
+{manager_state}
 
 # Current chunk evidence
 {compiled.text}
