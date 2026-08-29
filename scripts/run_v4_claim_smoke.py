@@ -96,7 +96,7 @@ def main() -> None:
                 store.record_v4_batch(sample_id, batch_ordinal=chunk_ordinal, input_hash=sha256_text(compiled.text), source_unit_ordinals=[message.unit_ordinal for message in current], input_text=compiled.text, memory_before_json=json.dumps({"manager_context_schema": "v4.1", "manager_context": manager_context_json, "edges": state.edges, "raw_claims": state.raw_claims, "quarantine_claims": state.quarantine_claims}, ensure_ascii=False, sort_keys=True), raw_response=response.content, parse_status="parse_error", claims=[], edges=state.edges, raw_claims=state.raw_claims, quarantine_claims=state.quarantine_claims)
                 sample["chunks"].append(chunk_result)
                 continue
-            normalized = [normalize_v4_claim(claim, compiled, ordinal=index) for index, claim in enumerate(claims)]
+            normalized = [normalize_v4_claim(claim, compiled, ordinal=index, batch_ordinal=chunk_ordinal) for index, claim in enumerate(claims)]
             routes = [state.route(claim) for claim in normalized]
             claim_rows = []
             for claim, route in zip(normalized, routes, strict=True):

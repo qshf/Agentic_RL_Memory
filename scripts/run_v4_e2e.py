@@ -160,7 +160,7 @@ def main() -> None:
                 record_call(store, sample_id, call_ordinal, "sidecar_manager", response)
                 try:
                     claims = parse_v4_manager_response(response.content, compiled)
-                    normalized = [normalize_v4_claim(claim, compiled, ordinal=index) for index, claim in enumerate(claims)]
+                    normalized = [normalize_v4_claim(claim, compiled, ordinal=index, batch_ordinal=chunk_ordinal) for index, claim in enumerate(claims)]
                     routes = [state.route(claim) for claim in normalized]
                     parse_status = "ok"
                     claim_rows = _claim_rows(normalized, routes)

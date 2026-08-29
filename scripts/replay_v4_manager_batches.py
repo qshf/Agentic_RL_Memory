@@ -62,7 +62,7 @@ def replay_sample(store: TrajectoryStore, sample_row, source_row: dict, *, chunk
                 unavailable += 1
                 continue
             claims = parse_v4_manager_response(batch["raw_response"], compiled)
-            normalized = [normalize_v4_claim(claim, compiled, ordinal=ordinal) for ordinal, claim in enumerate(claims)]
+            normalized = [normalize_v4_claim(claim, compiled, ordinal=ordinal, batch_ordinal=int(batch["batch_ordinal"])) for ordinal, claim in enumerate(claims)]
             for claim in normalized:
                 state.route(claim)
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:

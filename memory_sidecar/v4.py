@@ -172,7 +172,9 @@ def _incomplete_claim(raw: dict[str, Any], ordinal: str) -> V4Claim:
     return V4Claim("", "", "", (), model_claim={**raw, "_ordinal": ordinal})
 
 
-def normalize_v4_claim(claim: V4Claim, compiled: CompiledEvidence, *, ordinal: int) -> NormalizedV4Claim:
+def normalize_v4_claim(
+    claim: V4Claim, compiled: CompiledEvidence, *, ordinal: int, batch_ordinal: int | None = None,
+) -> NormalizedV4Claim:
     """Normalize one claim without inventing facts or silently dropping failures."""
     actions: list[dict[str, Any]] = []
     refs = tuple(compiled.evidence[evidence_id].source_ref() for evidence_id in claim.evidence_ids if evidence_id in compiled.evidence)
@@ -180,7 +182,7 @@ def normalize_v4_claim(claim: V4Claim, compiled: CompiledEvidence, *, ordinal: i
     # Optional claim_text is audit-only. Normalization must always inspect the
     # complete cited user evidence so a model cannot add or hide typed values.
     raw_text = "\n".join(evidence_contents)
-    claim_id = sha256_text(json.dumps({"ordinal": ordinal, "claim": claim.model_claim}, ensure_ascii=False, sort_keys=True))[:24]
+    claim_id = sha256_text(json.dumps({"batch_ordinal": batch_ordinal, "ordinal": ordinal, "claim": claim.model_claim}, ensure_ascii=False, sort_keys=True))[:24]
     if not claim.subject_text or not claim.relation or not claim.object_text or not refs:
         return NormalizedV4Claim(claim_id, "incomplete", None, None, None, None, {}, _unparsed_time(None), {}, refs, raw_text, "unknown", tuple(actions), claim.model_claim)
 
@@ -797,6 +799,8 @@ def _edge_from_claim(claim: NormalizedV4Claim, *, occurrence_key: str | None, st
         "occurrence_key": occurrence_key,
         "functional_key": _functional_key(claim) if claim.predicate in _FUNCTIONAL_PREDICATES else None,
         "normalization_actions": list(claim.normalization_actions),
+        "attribute_conflicts": {},
+        "superseded_by": None,
     }
 
 
