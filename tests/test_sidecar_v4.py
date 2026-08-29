@@ -267,6 +267,41 @@ def test_query_projection_excludes_non_grocery_amounts_for_grocery_question():
     assert meta["selected_edge_count"] == 1
 
 
+def test_count_in_object_text_is_normalized_and_query_projection_filters_courses():
+    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I completed courses.")])
+    state = V4GraphState()
+    for ordinal, payload in enumerate([
+        _claim(relation="completed", object_text="8 edX courses", evidence_ids=[0]),
+        _claim(relation="completed", object_text="12 courses on Coursera", evidence_ids=[0]),
+        _claim(relation="completed", object_text="5 days exploring the islands", evidence_ids=[0]),
+    ]):
+        claim = parse_v4_manager_response(json.dumps({"claims": [payload]}), compiled)[0]
+        state.route(normalize_v4_claim(claim, compiled, ordinal=ordinal))
+    context, meta = render_v4_query_projection(state, "What is the total number of online courses I've completed?")
+    assert "total=20" in context
+    assert "5 days" not in context
+    assert meta["selected_edge_count"] == 2
+
+
+def test_temporal_query_projection_filters_unrelated_time_facts():
+    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I wake up at 7:30 and like trendy clothes.")])
+    state = V4GraphState()
+    for ordinal, payload in enumerate([
+        _claim(relation="observed", object_text="waking up at 7:30 am on Saturdays", evidence_ids=[0]),
+        _claim(relation="prefers", object_text="trendy clothes", evidence_ids=[0]),
+    ]):
+        claim = parse_v4_manager_response(json.dumps({"claims": [payload]}), compiled)[0]
+        state.route(normalize_v4_claim(claim, compiled, ordinal=ordinal))
+    context, meta = render_v4_query_projection(state, "What time do I wake up on Saturday mornings?")
+    assert "waking up at 7:30" in context
+    assert "trendy clothes" not in context
+    assert meta["selected_edge_count"] == 1
+
+
+def test_question_classifier_routes_total_expenses_to_amount_projection():
+    assert classify_v4_question("How much total money have I spent on bike-related expenses since the start of the year?") == "amount_total"
+
+
 def test_manager_prompt_does_not_embed_growing_graph_state():
     prompt = manager_v4_messages(
         V4GraphState(edges=[{"edge_id": "old", "object": "must not enter the prompt"}]),

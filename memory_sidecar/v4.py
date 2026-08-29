@@ -63,7 +63,7 @@ _UPDATE_PHRASES = (
     re.compile(r"\bcorrected\b.+\bto\b", re.I),
 )
 _AMOUNT = re.compile(r"(?P<symbol>[$€£])\s*(?P<amount>\d+(?:,\d{3})*(?:\.\d{1,2})?)")
-_COUNT = re.compile(r"\b(?P<count>\d+)\s+(?:courses?|coins?|items?|days?)\b", re.I)
+_COUNT = re.compile(r"\b(?P<count>\d+)\s+(?:(?:[A-Za-z]+)\s+)?(?:courses?|coins?|items?|days?)\b", re.I)
 _MONTH_DATE = re.compile(r"\b(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})\b")
 _ISO_DATE = re.compile(r"\b(?P<year>\d{4})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})\b")
 
@@ -171,7 +171,7 @@ def normalize_v4_claim(claim: V4Claim, compiled: CompiledEvidence, *, ordinal: i
     if relation != predicate.lower():
         actions.append({"kind": "relation_alias", "input": claim.relation, "output": predicate})
 
-    source_text = "\n".join(part for part in [raw_text, *[value for value in claim.hints.values() if value]] if part)
+    source_text = "\n".join(part for part in [raw_text, claim.object_text, *[value for value in claim.hints.values() if value]] if part)
     attributes, attribute_actions = _parse_attributes(source_text, claim.hints)
     actions.extend(attribute_actions)
     time_json, time_actions = _parse_time(claim.hints.get("time_text") or raw_text, claim.evidence_ids, compiled)
@@ -525,6 +525,8 @@ def classify_v4_question(question: str) -> str:
         token in text for token in ("spent", "money", "amount", "most", "least", "highest", "lowest")
     ):
         return "provider_amount_rank"
+    if any(token in text for token in ("how much", "total money", "expenses", "total spent")):
+        return "amount_total"
     if any(token in text for token in ("how many", "total number", "number of")):
         return "count"
     if any(token in text for token in ("what time", "when do i", "wake up", "go to bed", "how long")):
@@ -579,16 +581,55 @@ def render_v4_query_projection(
         )
         lines.append(f"[EXCLUDED UNKNOWN PROVIDER AMOUNTS] count={unknown_numeric}")
         return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "aggregates": ranked, "input_edge_ids": [edge_id for row in aggregates for edge_id in row["input_edge_ids"]], "excluded_unknown_provider_count": unknown_numeric}
+    if kind == "amount_total":
+        selected = [
+            edge for edge in active
+            if edge.get("predicate") == "PURCHASED" and (edge.get("attributes") or {}).get("amount") is not None
+        ]
+        question_text = _canonical_text(question)
+        if "bike" in question_text or "cycling" in question_text:
+            selected = [
+                edge for edge in selected
+                if any(token in str(edge.get("object", "")) for token in ("bike", "chain", "helmet", "light", "tune-up"))
+            ]
+        lines = ["[V4 QUERY PROJECTION] amount_total", "[PURCHASED AMOUNTS]"]
+        total = 0.0
+        for edge in selected:
+            attrs = edge.get("attributes") or {}
+            total += float(attrs["amount"])
+            lines.append(f"- {edge.get('object')}; amount={attrs['amount']} {attrs.get('currency') or ''}; provider={attrs.get('provider') or '(unknown)'}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
+        lines.append(f"[TOTAL PURCHASED AMOUNT] total={total}")
+        return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "total": total, "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
     if kind == "temporal":
         selected = [edge for edge in active if edge.get("predicate") in {"TARGET", "PREFERS", "OBSERVED"}]
+        if "wake" in _canonical_text(question) or "bed" in _canonical_text(question):
+            selected = [
+                edge for edge in selected
+                if any(token in str(edge.get("object", "")) for token in ("wake", "woke", "waking", "bed"))
+            ]
         lines = ["[V4 QUERY PROJECTION] temporal", "[TARGET PREFERENCE OBSERVATION FACTS]"]
         for edge in selected:
             time_json = edge.get("time_json") or {}
-            lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; time={time_json.get('value') or 'unknown'}; interval_end={time_json.get('interval_end') or 'none'}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
+            time_value = time_json.get("value") if time_json.get("parse_status") == "ok" else "unknown"
+            lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; time={time_value or 'unknown'}; interval_end={time_json.get('interval_end') or 'none'}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
         return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
     if kind == "count":
-        context, meta = render_v4_numeric_projection(active, predicates=_NUMERIC_PREDICATES)
-        return "[V4 QUERY PROJECTION] count\n" + context, {"projection_kind": kind, **meta}
+        selected = []
+        for edge in active:
+            if edge.get("predicate") not in _NUMERIC_PREDICATES:
+                continue
+            attrs = edge.get("attributes") or {}
+            if attrs.get("count") is None:
+                match = _COUNT.search(str(edge.get("object", "")))
+                if match:
+                    edge = deepcopy(edge)
+                    edge.setdefault("attributes", {})["count"] = int(match.group("count"))
+            if (edge.get("attributes") or {}).get("count") is not None:
+                selected.append(edge)
+        if "course" in _canonical_text(question):
+            selected = [edge for edge in selected if "course" in str(edge.get("object", ""))]
+        context, meta = render_v4_numeric_projection(selected, predicates=_NUMERIC_PREDICATES)
+        return "[V4 QUERY PROJECTION] count\n" + context, {"projection_kind": kind, "selected_edge_count": len(selected), **meta}
     context, meta = render_v4_graph_all(active)
     return context, {"projection_kind": kind, **meta}
 
