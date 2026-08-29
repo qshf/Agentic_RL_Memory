@@ -48,10 +48,12 @@ _RELATION_ALIASES = {
     "has_completed": "COMPLETED",
     "completed courses": "COMPLETED",
     "finished": "COMPLETED",
-    "bought": "PURCHASED",
+    "observed wake time": "OBSERVED_WAKE_TIME",
+    "observed_wake_time": "OBSERVED_WAKE_TIME",
+    "wake time observed": "OBSERVED_WAKE_TIME",
 }
-_OCCURRENCE_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "MENTIONS"})
-_NUMERIC_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED"})
+_OCCURRENCE_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "OBSERVED_WAKE_TIME", "MENTIONS"})
+_NUMERIC_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "OBSERVED_WAKE_TIME"})
 _GROCERY_PROVIDER_HINTS = frozenset({"walmart", "publix", "trader joe's", "thrive market", "whole foods", "kroger", "aldi", "instacart"})
 _GROCERY_OBJECT_HINTS = frozenset({"grocery", "groceries", "chicken", "beef", "produce", "organic", "food", "meals", "snacks", "pantry", "dairy", "vegetable", "fruit"})
 _FUNCTIONAL_PREDICATES = frozenset({"TARGET", "PREFERS", "PLANS", "LOCATED_IN"})
@@ -131,18 +133,36 @@ def parse_v4_manager_response(text: str, compiled: CompiledEvidence) -> list[V4C
             result.append(_incomplete_claim(item, f"item-{ordinal}"))
             continue
         if not isinstance(evidence_ids, list) or not evidence_ids or any(
-            not isinstance(value, int) or isinstance(value, bool) or value not in compiled.evidence for value in evidence_ids
+            not isinstance(value, int) or isinstance(value, bool) or value not in compiled.evidence
+            or compiled.evidence[value].role != "user"
+            for value in evidence_ids
         ):
-            result.append(_incomplete_claim(item, f"item-{ordinal}"))
+            result.append(_incomplete_claim({**item, "_invalid_reason": "evidence_must_be_user"}, f"item-{ordinal}"))
             continue
         hints = item.get("hints", {})
         if not isinstance(hints, Mapping):
             hints = {}
+        evidence_text = "\n".join(compiled.evidence[value].content for value in evidence_ids)
+        invalid_optional: list[str] = []
+        valid_hints: dict[str, str | None] = {}
+        for key, value in hints.items():
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if value.casefold() not in evidence_text.casefold():
+                invalid_optional.append(f"hints.{key}")
+                continue
+            valid_hints[str(key)] = value
         claim_text = item.get("claim_text")
+        if isinstance(claim_text, str) and claim_text.strip() and claim_text.casefold() not in evidence_text.casefold():
+            invalid_optional.append("claim_text")
+            claim_text = None
+        model_claim = dict(item)
+        if invalid_optional:
+            model_claim["_invalid_optional_fields"] = invalid_optional
         result.append(V4Claim(
             subject_text=str(subject), relation=str(relation), object_text=str(object_text),
             evidence_ids=tuple(evidence_ids), claim_text=claim_text if isinstance(claim_text, str) and claim_text.strip() else None,
-            hints={str(key): value if isinstance(value, str) else None for key, value in hints.items()}, model_claim=item,
+            hints=valid_hints, model_claim=model_claim,
         ))
     return result
 
@@ -156,7 +176,10 @@ def normalize_v4_claim(claim: V4Claim, compiled: CompiledEvidence, *, ordinal: i
     """Normalize one claim without inventing facts or silently dropping failures."""
     actions: list[dict[str, Any]] = []
     refs = tuple(compiled.evidence[evidence_id].source_ref() for evidence_id in claim.evidence_ids if evidence_id in compiled.evidence)
-    raw_text = claim.claim_text or "\n".join(compiled.evidence[evidence_id].content for evidence_id in claim.evidence_ids if evidence_id in compiled.evidence)
+    evidence_contents = [compiled.evidence[evidence_id].content for evidence_id in claim.evidence_ids if evidence_id in compiled.evidence and compiled.evidence[evidence_id].role == "user"]
+    # Optional claim_text is audit-only. Normalization must always inspect the
+    # complete cited user evidence so a model cannot add or hide typed values.
+    raw_text = "\n".join(evidence_contents)
     claim_id = sha256_text(json.dumps({"ordinal": ordinal, "claim": claim.model_claim}, ensure_ascii=False, sort_keys=True))[:24]
     if not claim.subject_text or not claim.relation or not claim.object_text or not refs:
         return NormalizedV4Claim(claim_id, "incomplete", None, None, None, None, {}, _unparsed_time(None), {}, refs, raw_text, "unknown", tuple(actions), claim.model_claim)
@@ -171,11 +194,13 @@ def normalize_v4_claim(claim: V4Claim, compiled: CompiledEvidence, *, ordinal: i
     if relation != predicate.lower():
         actions.append({"kind": "relation_alias", "input": claim.relation, "output": predicate})
 
-    source_text = "\n".join(part for part in [raw_text, claim.object_text, *[value for value in claim.hints.values() if value]] if part)
+    source_text = raw_text
     attributes, attribute_actions = _parse_attributes(source_text, claim.hints)
     actions.extend(attribute_actions)
     time_json, time_actions = _parse_time(claim.hints.get("time_text") or raw_text, claim.evidence_ids, compiled)
     actions.extend(time_actions)
+    for field in claim.model_claim.get("_invalid_optional_fields", []):
+        actions.append({"kind": "invalid_optional_field", "field": field})
     scope_text = claim.hints.get("scope_text")
     scope_json = {"value": _canonical_text(scope_text), "parse_status": "ok"} if scope_text else {"value": None, "parse_status": "unknown"}
     if scope_text is None:
@@ -328,15 +353,20 @@ class V4GraphState:
 
     def _route_occurrence(self, claim: NormalizedV4Claim) -> dict[str, Any]:
         identity = _occurrence_identity(claim)
+        ambiguous_day = False
         if identity is not None:
             for edge in self.edges:
                 if edge.get("occurrence_key") == identity and edge.get("status") != "superseded":
+                    if _is_ambiguous_day_match(edge, claim):
+                        ambiguous_day = True
+                        continue
                     changed, merged_fields = _merge_duplicate_edge(edge, claim)
                     result = "deduplicated_merged" if changed else "deduplicated"
                     return {
                         "route_status": result,
                         "claim_id": claim.claim_id,
                         "edge_id": edge["edge_id"],
+                        "dedupe_rule": "exact_key",
                         "merged_fields": merged_fields,
                     }
         for edge in self.edges:
@@ -346,11 +376,17 @@ class V4GraphState:
                     "route_status": "deduplicated_alias_merged" if changed else "deduplicated_alias",
                     "claim_id": claim.claim_id,
                     "edge_id": edge["edge_id"],
+                    "dedupe_rule": "provider_suffix_same_source",
                     "merged_fields": merged_fields,
                 }
-        edge = _edge_from_claim(claim, occurrence_key=identity, status="completed" if claim.predicate in {"PURCHASED", "ATTENDED", "COMPLETED"} else "observed")
+        edge = _edge_from_claim(claim, occurrence_key=None if ambiguous_day else identity, status="completed" if claim.predicate in {"PURCHASED", "ATTENDED", "COMPLETED"} else "observed")
         self.edges.append(edge)
-        return {"route_status": "applied_ambiguous_occurrence" if identity is None else "applied", "claim_id": claim.claim_id, "edge_id": edge["edge_id"]}
+        return {
+            "route_status": "applied_ambiguous_occurrence" if identity is None or ambiguous_day else "applied",
+            "claim_id": claim.claim_id,
+            "edge_id": edge["edge_id"],
+            "dedupe_rule": "ambiguous_day" if ambiguous_day else None,
+        }
 
     def _route_functional(self, claim: NormalizedV4Claim) -> dict[str, Any]:
         scope = claim.scope_json.get("value")
@@ -601,7 +637,7 @@ def render_v4_query_projection(
         lines.append(f"[TOTAL PURCHASED AMOUNT] total={total}")
         return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "total": total, "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
     if kind == "temporal":
-        selected = [edge for edge in active if edge.get("predicate") in {"TARGET", "PREFERS", "OBSERVED"}]
+        selected = [edge for edge in active if edge.get("predicate") in {"TARGET", "PREFERS", "OBSERVED", "OBSERVED_WAKE_TIME"}]
         if "wake" in _canonical_text(question) or "bed" in _canonical_text(question):
             selected = [
                 edge for edge in selected
@@ -640,16 +676,49 @@ def answer_v4_messages(graph_context: str, raw_tail: str, question_date: str, qu
 
 
 def _occurrence_identity(claim: NormalizedV4Claim) -> str | None:
-    time_value = claim.time_json.get("value") if claim.time_json.get("parse_status") == "ok" else None
+    time_json = claim.time_json if claim.time_json.get("parse_status") == "ok" else {}
+    time_value = time_json.get("value")
     provider = claim.attributes.get("provider")
     location = claim.attributes.get("location")
-    scope = claim.scope_json.get("value") if claim.scope_json.get("parse_status") == "ok" else None
+    scope_json = claim.scope_json if claim.scope_json.get("parse_status") == "ok" else {"value": None, "parse_status": "unknown"}
+    scope = scope_json.get("value")
     # Without a time or any contextual discriminator, a repeated mention may be a
     # new occurrence. Preserve it instead of silently merging it.
     if not any((time_value, provider, location, scope)):
         return None
-    payload = [claim.subject, claim.predicate, claim.object, time_value, provider, location, scope]
-    return sha256_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))[:24]
+    payload = {
+        "subject": claim.subject,
+        "predicate": claim.predicate,
+        "canonical_object": claim.object,
+        "time": {
+            "value": time_json.get("value"),
+            "granularity": time_json.get("granularity"),
+            "interval_end": time_json.get("interval_end"),
+            "recurrence": time_json.get("recurrence"),
+        },
+        "provider": provider,
+        "location": location,
+        "scope": {"value": scope_json.get("value"), "parse_status": scope_json.get("parse_status")},
+    }
+    return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))[:24]
+
+
+def _has_day_only_time(claim: NormalizedV4Claim) -> bool:
+    time_json = claim.time_json
+    return time_json.get("parse_status") == "ok" and time_json.get("granularity") == "day" and not time_json.get("interval_end")
+
+
+def _source_refs_overlap(left: Mapping[str, Any], right: NormalizedV4Claim) -> bool:
+    existing = {(ref.get("session_id"), ref.get("unit_ordinal")) for ref in left.get("source_refs", [])}
+    incoming = {(ref.get("session_id"), ref.get("unit_ordinal")) for ref in right.source_refs}
+    return bool(existing & incoming)
+
+
+def _is_ambiguous_day_match(edge: Mapping[str, Any], claim: NormalizedV4Claim) -> bool:
+    """A day-only key cannot merge claims from distinct source units."""
+    if not _has_day_only_time(claim):
+        return False
+    return not _source_refs_overlap(edge, claim)
 
 
 def _same_provider_suffix_occurrence(edge: Mapping[str, Any], claim: NormalizedV4Claim) -> bool:
@@ -666,6 +735,10 @@ def _same_provider_suffix_occurrence(edge: Mapping[str, Any], claim: NormalizedV
     if edge.get("subject") != claim.subject or edge.get("predicate") != claim.predicate:
         return False
     if not _same_time(edge.get("time_json") or {}, claim.time_json):
+        return False
+    existing_scope = edge.get("scope_json") or {}
+    incoming_scope = claim.scope_json or {}
+    if (existing_scope.get("parse_status"), existing_scope.get("value")) != (incoming_scope.get("parse_status"), incoming_scope.get("value")):
         return False
     numeric_match = False
     for field in ("amount", "currency", "count", "location"):
@@ -694,12 +767,7 @@ def _same_provider_suffix_occurrence(edge: Mapping[str, Any], claim: NormalizedV
 
 
 def _same_time(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    return (
-        left.get("parse_status") == "ok"
-        and right.get("parse_status") == "ok"
-        and left.get("value") == right.get("value")
-        and left.get("interval_end") == right.get("interval_end")
-    )
+    return all(left.get(field) == right.get(field) for field in ("value", "granularity", "interval_end", "recurrence")) and left.get("parse_status") == right.get("parse_status") == "ok"
 
 
 def _strip_provider_suffix(object_text: str, provider: str) -> str:
@@ -796,7 +864,7 @@ def _claim_audit(claim: NormalizedV4Claim) -> dict[str, Any]:
 
 
 def render_v4_manager_state(
-    state: V4GraphState, *, max_edges: int = 32, max_raw_claims: int = 8,
+    state: V4GraphState, *, max_edges: int = 64, max_raw_claims: int = 8,
     current_text: str = "",
 ) -> str:
     """Render a bounded graph view for the next extraction call.
@@ -811,12 +879,18 @@ def render_v4_manager_state(
     user_evidence = "\n".join(
         re.findall(r"\[e\d+\]\[user\]\s*(.*?)(?=\n\[e\d+\]\[|\Z)", current_text, flags=re.S)
     )
-    query_terms = set(re.findall(r"[a-z0-9]+", _canonical_text(user_evidence or current_text)))
+    query_terms = {
+        token for token in re.findall(r"[a-z0-9]+", _canonical_text(user_evidence))
+        if len(token) >= 2 and token not in {"the", "and", "or", "to", "in", "of", "is", "a", "an"}
+    }
 
     def edge_terms(edge: Mapping[str, Any]) -> set[str]:
         attrs = edge.get("attributes") or {}
-        values = [edge.get("subject"), edge.get("predicate"), edge.get("object"), attrs.get("provider"), attrs.get("location")]
-        return set(re.findall(r"[a-z0-9]+", _canonical_text(" ".join(str(value) for value in values if value))))
+        values = [edge.get("object"), attrs.get("provider"), attrs.get("location")]
+        return {
+            token for token in re.findall(r"[a-z0-9]+", _canonical_text(" ".join(str(value) for value in values if value)))
+            if len(token) >= 2 and token not in {"the", "and", "or", "to", "in", "of", "is", "a", "an"}
+        }
 
     def relevance(edge: Mapping[str, Any]) -> int:
         # Ignore one-character/common relation tokens; object/provider overlap
@@ -824,13 +898,19 @@ def render_v4_manager_state(
         terms = edge_terms(edge)
         return len((terms & query_terms) - {"user", "the", "and", "or", "to", "in", "of"})
 
-    ranked = sorted(
-        enumerate(active_edges),
-        key=lambda item: (relevance(item[1]), item[1].get("occurrence_key") is None, item[0]),
-        reverse=True,
+    relevant_candidates = [(index, edge) for index, edge in enumerate(active_edges) if relevance(edge) > 0]
+    relevant_ranked = sorted(
+        relevant_candidates,
+        key=lambda item: (-relevance(item[1]), -(1 if item[1].get("occurrence_key") is not None else 0), -item[0], str(item[1].get("edge_id", ""))),
     )
-    selected_edges = [edge for _, edge in ranked[:max_edges]] if max_edges else []
-    relevant_edge_count = sum(1 for edge in active_edges if relevance(edge) > 0)
+    relevant_budget = min(48, max_edges)
+    relevant_edges = [edge for _, edge in relevant_ranked[:relevant_budget]] if relevant_budget else []
+    selected_ids = {str(edge.get("edge_id")) for edge in relevant_edges}
+    recent_candidates = [(index, edge) for index, edge in enumerate(active_edges) if str(edge.get("edge_id")) not in selected_ids]
+    recent_ranked = sorted(recent_candidates, key=lambda item: (-item[0], str(item[1].get("edge_id", ""))))
+    recent_budget = max(0, max_edges - len(relevant_edges))
+    recent_edges = [edge for _, edge in recent_ranked[:recent_budget]] if recent_budget else []
+    relevant_edge_count = len(relevant_candidates)
     def compact_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
         attributes = edge.get("attributes") or {}
         time_json = edge.get("time_json") or {}
@@ -859,20 +939,24 @@ def render_v4_manager_state(
 
     return json.dumps(
         {
-            "version": 4,
-            "edges": [compact_edge(edge) for edge in selected_edges],
+            "version": "4.1",
+            "manager_graph_edge_budget": max_edges,
+            "relevant_edges": [compact_edge(edge) for edge in relevant_edges],
+            "recent_edges": [compact_edge(edge) for edge in recent_edges],
             "raw_claims": [compact_raw_claim(claim) for claim in state.raw_claims[-max_raw_claims:]] if max_raw_claims else [],
-            "truncated": len(selected_edges) < len(active_edges) or len(state.raw_claims) > max_raw_claims,
             "active_edge_count": len(active_edges),
             "relevant_edge_count": relevant_edge_count,
-            "selection_mode": "lexical_relevance_then_recency" if current_text else "recency_fallback",
+            "recent_edge_count": len(recent_candidates),
+            "relevant_edge_truncated": len(relevant_edges) < len(relevant_candidates),
+            "recent_edge_truncated": len(recent_edges) < len(recent_candidates),
+            "selection_mode": "user_object_provider_location_relevance_then_recency" if user_evidence else "recency_fallback",
         },
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
 
 
 def manager_v4_messages(
-    state: V4GraphState, compiled: CompiledEvidence, *, max_edges: int = 32,
+    state: V4GraphState, compiled: CompiledEvidence, *, max_edges: int = 64,
 ) -> list[dict[str, str]]:
     """Build a graph-aware extraction prompt; routing still owns canonical state."""
     manager_state = render_v4_manager_state(state, max_edges=max_edges, current_text=compiled.text)

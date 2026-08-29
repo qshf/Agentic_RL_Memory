@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manager-max-tokens", type=int, default=2048)
     parser.add_argument("--answer-max-tokens", type=int, default=1024)
     parser.add_argument("--raw-tail-budget", type=int, default=16 * 1024)
-    parser.add_argument("--manager-graph-max-edges", type=int, default=32)
+    parser.add_argument("--manager-graph-max-edges", type=int, default=64)
     parser.add_argument(
         "--projection",
         choices=("graph-all", "numeric-all", "query-auto"),
@@ -112,6 +112,8 @@ def main() -> None:
         "model": {"model": args.model, "base_url": args.base_url},
         "chunk_budget_tokens": args.chunk_budget,
         "manager_max_tokens": args.manager_max_tokens,
+        "manager_graph_max_edges": args.manager_graph_max_edges,
+        "manager_context_schema": "v4.1",
         "manager_state": "stateless_program_routed",
         "manager_prompt_version": "v4-minimal-claims-stateless-v2",
         "answer_max_tokens": args.answer_max_tokens,
@@ -147,6 +149,8 @@ def main() -> None:
                 before = json.dumps({
                     "edges": state.edges,
                     "raw_claims": state.raw_claims,
+                    "quarantine_claims": state.quarantine_claims,
+                    "manager_context_schema": "v4.1",
                     "manager_context": json.loads(manager_context),
                 }, ensure_ascii=False, sort_keys=True)
                 call_ordinal += 1
@@ -176,8 +180,11 @@ def main() -> None:
                     "routes": Counter(route.get("route_status") for route in routes),
                     "input_tokens": response.input_tokens, "output_tokens": response.output_tokens,
                     "parse_status": parse_status,
-                    "manager_graph_edge_count": len(json.loads(manager_context)["edges"]),
-                    "manager_graph_truncated": json.loads(manager_context)["truncated"],
+                    "manager_graph_edge_count": len(json.loads(manager_context)["relevant_edges"]) + len(json.loads(manager_context)["recent_edges"]),
+                    "manager_graph_relevant_edge_count": len(json.loads(manager_context)["relevant_edges"]),
+                    "manager_graph_recent_edge_count": len(json.loads(manager_context)["recent_edges"]),
+                    "manager_graph_relevant_truncated": json.loads(manager_context)["relevant_edge_truncated"],
+                    "manager_graph_recent_truncated": json.loads(manager_context)["recent_edge_truncated"],
                 })
 
             if args.projection == "graph-all":

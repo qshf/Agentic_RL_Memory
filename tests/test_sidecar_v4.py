@@ -10,8 +10,8 @@ from utils.store import TrajectoryStore
 
 def _compiled():
     return compile_evidence([
-        SimpleNamespace(unit_ordinal=10, session_id="s1", session_date="2023/05/27", role="user", content="I bought a chain for $25 on 2023-05-20."),
-        SimpleNamespace(unit_ordinal=11, session_id="s2", session_date="2023/05/28", role="user", content="I still live in Chicago."),
+        SimpleNamespace(unit_ordinal=10, session_id="s1", session_date="2023/05/27", role="user", content="I bought a chain for $25 on 2023-05-20 from Bike Shop. Previous Saturday I was there."),
+        SimpleNamespace(unit_ordinal=11, session_id="s2", session_date="2023/05/28", role="user", content="I still live in Chicago at home and changed Chicago to Tampa."),
     ])
 
 
@@ -55,23 +55,49 @@ def test_missing_core_field_is_quarantined():
     assert not state.edges
 
 
+def test_non_user_evidence_is_quarantined():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/05/27", role="assistant", content="I bought a chain for $25.",
+    )])
+    claims = parse_v4_manager_response(json.dumps({"claims": [_claim(evidence_ids=[0])]}), compiled)
+    normalized = normalize_v4_claim(claims[0], compiled, ordinal=0)
+    assert normalized.parse_status == "incomplete"
+    assert normalized.model_claim["_invalid_reason"] == "evidence_must_be_user"
+
+
+def test_invalid_optional_fields_do_not_change_normalization():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/05/27", role="user", content="I bought a chain.",
+    )])
+    claim = parse_v4_manager_response(json.dumps({"claims": [_claim(
+        claim_text="I bought a car for $999 on 2020-01-01.",
+        hints={"amount_text": "$999", "time_text": "2020-01-01", "provider_text": "car dealer"},
+    )]}), compiled)[0]
+    normalized = normalize_v4_claim(claim, compiled, ordinal=0)
+    assert normalized.attributes["amount"] is None
+    assert normalized.time_json["parse_status"] == "unparsed"
+    assert {action["field"] for action in normalized.normalization_actions if action["kind"] == "invalid_optional_field"} == {
+        "claim_text", "hints.amount_text", "hints.time_text", "hints.provider_text",
+    }
+
+
 def test_occurrence_key_uses_normalized_fields_and_deduplicates():
     compiled = _compiled()
     first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(hints={"time_text": "2023-05-20"})]}), compiled)[0], compiled, ordinal=0)
     second = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(claim_text="I purchased a bike chain replacement on May 20, 2023.", hints={"time_text": "2023-05-20"})]}), compiled)[0], compiled, ordinal=1)
     state = V4GraphState()
     assert state.route(first)["route_status"] == "applied"
-    assert state.route(second)["route_status"] == "deduplicated"
+    assert state.route(second)["route_status"] == "deduplicated_merged"
     assert len(state.edges) == 1
 
 
 def test_duplicate_occurrence_merges_late_amount_and_provenance():
-    compiled = compile_evidence([SimpleNamespace(
-        unit_ordinal=10, session_id="s1", session_date="2023/05/27", role="user",
-        content="I bought a Bell Zephyr helmet from the local bike shop downtown.",
-    )])
-    first_payload = _claim(object_text="Bell Zephyr helmet", hints={"time_text": "2023-05-20", "provider_text": "local bike shop downtown"})
-    second_payload = _claim(object_text="Bell Zephyr helmet", hints={"time_text": "2023-05-20", "provider_text": "local bike shop downtown", "amount_text": "$120"})
+    compiled = compile_evidence([
+        SimpleNamespace(unit_ordinal=10, session_id="s1", session_date="2023/05/27", role="user", content="I bought a Bell Zephyr helmet from the local bike shop downtown last month."),
+        SimpleNamespace(unit_ordinal=11, session_id="s1", session_date="2023/05/27", role="user", content="The Bell Zephyr helmet from the local bike shop downtown last month cost $120."),
+    ])
+    first_payload = _claim(object_text="Bell Zephyr helmet", hints={"time_text": "last month", "provider_text": "local bike shop downtown"}, evidence_ids=[0])
+    second_payload = _claim(object_text="Bell Zephyr helmet", hints={"time_text": "last month", "provider_text": "local bike shop downtown", "amount_text": "$120"}, evidence_ids=[1])
     first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [first_payload]}), compiled)[0], compiled, ordinal=0)
     second = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [second_payload]}), compiled)[0], compiled, ordinal=1)
     state = V4GraphState()
@@ -95,6 +121,29 @@ def test_occurrence_without_discriminator_is_kept_as_ambiguous():
     assert len(state.edges) == 2
 
 
+def test_day_only_occurrence_merges_same_source_but_not_distinct_sources():
+    compiled = compile_evidence([
+        SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/27", role="user", content="I bought a chain on 2023-05-20."),
+        SimpleNamespace(unit_ordinal=20, session_id="s", session_date="2023/05/27", role="user", content="I bought another chain on 2023-05-20."),
+    ])
+    first_claim = _claim(object_text="chain", hints={"time_text": "2023-05-20"}, evidence_ids=[0])
+    second_claim = _claim(object_text="chain", hints={"time_text": "2023-05-20"}, evidence_ids=[1])
+    first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [first_claim]}), compiled)[0], compiled, ordinal=0)
+    second = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [second_claim]}), compiled)[0], compiled, ordinal=1)
+    state = V4GraphState()
+    assert state.route(first)["route_status"] == "applied"
+    route = state.route(second)
+    assert route["route_status"] == "applied_ambiguous_occurrence"
+    assert route["dedupe_rule"] == "ambiguous_day"
+    assert len(state.edges) == 2
+
+
+def test_observed_wake_time_alias_is_canonicalized():
+    claim = parse_v4_manager_response(json.dumps({"claims": [_claim(relation="observed wake time", object_text="7:30 am")]}), _compiled())[0]
+    normalized = normalize_v4_claim(claim, _compiled(), ordinal=0)
+    assert normalized.predicate == "OBSERVED_WAKE_TIME"
+
+
 def test_relative_time_uses_evidence_session_date():
     compiled = _compiled()
     claims = parse_v4_manager_response(json.dumps({"claims": [_claim(hints={"time_text": "previous Saturday"})]}), compiled)
@@ -105,7 +154,7 @@ def test_relative_time_uses_evidence_session_date():
 
 def test_relative_time_parses_week_month_and_last_saturday_intervals():
     compiled = compile_evidence([SimpleNamespace(
-        unit_ordinal=10, session_id="s", session_date="2023/05/15", role="user", content="I bought a thing.",
+        unit_ordinal=10, session_id="s", session_date="2023/05/15", role="user", content="I bought a thing last month, last week, the week before last, and last Saturday.",
     )])
     expectations = {
         "last month": ("2023-04-01", "2023-04-30", "month"),
@@ -135,8 +184,8 @@ def test_provider_suffix_alias_merges_same_evidence_numeric_occurrence():
 
 def test_provider_suffix_alias_merges_nearby_units_in_same_session():
     compiled = compile_evidence([
-        SimpleNamespace(unit_ordinal=271, session_id="s", session_date="2023/05/26", role="assistant", content="The order was from Thrive Market."),
-        SimpleNamespace(unit_ordinal=281, session_id="s", session_date="2023/05/26", role="assistant", content="The same Thrive Market order contained organic products."),
+        SimpleNamespace(unit_ordinal=271, session_id="s", session_date="2023/05/26", role="user", content="I placed an order from Thrive Market last week and spent $150."),
+        SimpleNamespace(unit_ordinal=281, session_id="s", session_date="2023/05/26", role="user", content="The same organic and sustainable products order was from Thrive Market last week and cost $150."),
     ])
     hints = {"provider_text": "Thrive Market", "amount_text": "$150", "time_text": "last week"}
     first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(object_text="organic and sustainable products", hints=hints, evidence_ids=[0])]}), compiled)[0], compiled, ordinal=0)
@@ -148,9 +197,13 @@ def test_provider_suffix_alias_merges_nearby_units_in_same_session():
 
 
 def test_functional_unknown_update_is_conflict_but_explicit_replace_supersedes():
-    compiled = _compiled()
-    first_claim = _claim(relation="lives in", object_text="Chicago", hints={"scope_text": "home"})
-    second_claim = _claim(relation="lives in", object_text="Tampa", hints={"scope_text": "home"}, claim_text="I live in Tampa now.")
+    compiled = compile_evidence([
+        SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/27", role="user", content="I live in Chicago at home."),
+        SimpleNamespace(unit_ordinal=11, session_id="s", session_date="2023/05/28", role="user", content="I live in Tampa at home."),
+        SimpleNamespace(unit_ordinal=12, session_id="s", session_date="2023/05/29", role="user", content="I changed Chicago to Tampa at home."),
+    ])
+    first_claim = _claim(relation="lives in", object_text="Chicago", hints={"scope_text": "home"}, evidence_ids=[0])
+    second_claim = _claim(relation="lives in", object_text="Tampa", hints={"scope_text": "home"}, claim_text="I live in Tampa at home.", evidence_ids=[1])
     first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [first_claim]}), compiled)[0], compiled, ordinal=0)
     second = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [second_claim]}), compiled)[0], compiled, ordinal=1)
     state = V4GraphState()
@@ -158,7 +211,7 @@ def test_functional_unknown_update_is_conflict_but_explicit_replace_supersedes()
     assert state.route(second)["route_status"] == "conflict"
     assert all(edge["status"] == "contradicted" for edge in state.edges)
 
-    replacement_claim = _claim(relation="lives in", object_text="Tampa", hints={"scope_text": "home"}, claim_text="I changed Chicago to Tampa.")
+    replacement_claim = _claim(relation="lives in", object_text="Tampa", hints={"scope_text": "home"}, claim_text="I changed Chicago to Tampa at home.", evidence_ids=[2])
     replacement = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [replacement_claim]}), compiled)[0], compiled, ordinal=2)
     assert replacement.update_intent == "replace"
     assert state.route(replacement)["route_status"] == "superseded"
@@ -206,7 +259,7 @@ def test_graph_all_merges_duplicate_relations_and_inlines_attributes():
     compiled = _compiled()
     payload = {"claims": [
         _claim(hints={"time_text": "2023-05-20", "provider_text": "Bike Shop"}),
-        _claim(claim_text="I purchased the bike chain replacement on May 20, 2023.", hints={"time_text": "2023-05-20", "provider_text": "Bike Shop"}),
+        _claim(claim_text="I bought a chain for $25 on 2023-05-20 from Bike Shop.", hints={"time_text": "2023-05-20", "provider_text": "Bike Shop"}),
     ]}
     claims = parse_v4_manager_response(json.dumps(payload), compiled)
     state = V4GraphState()
@@ -232,7 +285,7 @@ def test_numeric_projection_emits_auditable_unfiltered_aggregates():
 
 
 def test_query_projection_ranks_known_purchase_providers_only():
-    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I bought groceries.")])
+    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I bought groceries for $120 at Walmart last Saturday, organic products for $150 at Thrive Market last month, and a plan budget for $5000.")])
     claims = [
         _claim(object_text="groceries", hints={"amount_text": "$120", "provider_text": "Walmart", "time_text": "last Saturday"}),
         _claim(object_text="organic products", hints={"amount_text": "$150", "provider_text": "Thrive Market", "time_text": "last month"}),
@@ -252,7 +305,7 @@ def test_query_projection_ranks_known_purchase_providers_only():
 
 
 def test_query_projection_excludes_non_grocery_amounts_for_grocery_question():
-    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I bought groceries.")])
+    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I bought groceries for $120 at Walmart last Saturday and brown boots for $130 at Macy's last month.")])
     claims = [
         _claim(object_text="groceries", hints={"amount_text": "$120", "provider_text": "Walmart", "time_text": "last Saturday"}),
         _claim(object_text="brown boots", hints={"amount_text": "$130", "provider_text": "Macy's", "time_text": "last month"}),
@@ -327,9 +380,29 @@ def test_manager_state_caps_edges_and_keeps_truncation_marker():
         for index in range(3)
     ])
     rendered = json.loads(render_v4_manager_state(state, max_edges=2, max_raw_claims=0))
-    assert len(rendered["edges"]) == 2
-    assert rendered["truncated"] is True
+    assert len(rendered["relevant_edges"]) + len(rendered["recent_edges"]) == 2
+    assert rendered["recent_edge_truncated"] is True
     assert rendered["active_edge_count"] == 3
+
+
+def test_manager_state_uses_explicit_relevant_and_recent_layers():
+    state = V4GraphState(edges=[
+        {"edge_id": "edge-old", "occurrence_key": "occ-old", "status": "completed", "subject": "user", "predicate": "PURCHASED", "object": "midnight sky", "attributes": {}, "source_refs": []},
+        {"edge_id": "edge-new", "occurrence_key": "occ-new", "status": "completed", "subject": "user", "predicate": "PURCHASED", "object": "other item", "attributes": {}, "source_refs": []},
+    ])
+    rendered = json.loads(render_v4_manager_state(state, max_edges=2, max_raw_claims=0, current_text="[e0][user] I bought midnight sky."))
+    assert [edge["object"] for edge in rendered["relevant_edges"]] == ["midnight sky"]
+    assert [edge["object"] for edge in rendered["recent_edges"]] == ["other item"]
+    assert "edges" not in rendered and "truncated" not in rendered
+
+
+def test_manager_state_does_not_use_assistant_text_for_relevance():
+    state = V4GraphState(edges=[
+        {"edge_id": "edge-1", "occurrence_key": "occ-1", "status": "completed", "subject": "user", "predicate": "PURCHASED", "object": "assistant-only", "attributes": {}, "source_refs": []},
+    ])
+    rendered = json.loads(render_v4_manager_state(state, max_edges=1, current_text="[e0][assistant] assistant-only"))
+    assert rendered["relevant_edges"] == []
+    assert rendered["recent_edges"][0]["object"] == "assistant-only"
 
 
 def test_manager_state_prefers_edges_relevant_to_current_chunk():
@@ -348,9 +421,9 @@ def test_manager_state_prefers_edges_relevant_to_current_chunk():
             for index in range(40)
         ],
     ])
-    rendered = json.loads(render_v4_manager_state(state, max_edges=4, current_text="I downloaded the Midnight Sky EP again."))
-    assert any(edge["object"] == "midnight sky" for edge in rendered["edges"])
-    assert rendered["selection_mode"] == "lexical_relevance_then_recency"
+    rendered = json.loads(render_v4_manager_state(state, max_edges=4, current_text="[e0][user] I downloaded the Midnight Sky EP again."))
+    assert any(edge["object"] == "midnight sky" for edge in rendered["relevant_edges"])
+    assert rendered["selection_mode"] == "user_object_provider_location_relevance_then_recency"
     assert rendered["relevant_edge_count"] >= 1
 
 
@@ -368,11 +441,12 @@ def test_v4_store_persists_deduplicated_edge_field_merge(tmp_path):
     config = {"method": "memory_sidecar_v4", "model": {"model": "fake"}, "config_fingerprint": "fp"}
     store.start_run("v4", config)
     sample_id = store.start_sample("v4", "q", dataset_index=1, question_type="x", config_fingerprint="fp", code_version="test")
-    compiled = compile_evidence([SimpleNamespace(
-        unit_ordinal=10, session_id="s", session_date="2023/05/27", role="user", content="I bought a helmet.",
-    )])
-    first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(object_text="helmet", hints={"time_text": "2023-05-20"})]}), compiled)[0], compiled, ordinal=0)
-    second = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(object_text="helmet", hints={"time_text": "2023-05-20", "amount_text": "$120"})]}), compiled)[0], compiled, ordinal=1)
+    compiled = compile_evidence([
+        SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/27", role="user", content="I bought a helmet last month."),
+        SimpleNamespace(unit_ordinal=11, session_id="s", session_date="2023/05/27", role="user", content="The helmet I bought last month cost $120."),
+    ])
+    first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(object_text="helmet", hints={"time_text": "last month"}, evidence_ids=[0])]}), compiled)[0], compiled, ordinal=0)
+    second = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(object_text="helmet", hints={"time_text": "last month", "amount_text": "$120"}, evidence_ids=[1])]}), compiled)[0], compiled, ordinal=1)
     state = V4GraphState()
     state.route(first)
     store.record_v4_batch(sample_id, batch_ordinal=1, input_hash="one", source_unit_ordinals=[10], input_text=compiled.text, memory_before_json="{}", raw_response="{}", parse_status="ok", claims=[], edges=state.edges, raw_claims=[], quarantine_claims=[])
