@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import json
+import fcntl
+from contextlib import contextmanager
+from functools import wraps
 import re
 import sqlite3
 import time
@@ -20,6 +23,15 @@ STATUS_FAILED = "failed"
 STATUS_NOT_RUNNABLE = "not_runnable"
 
 _V3_EVENT_ID = re.compile(r"^b(\d+)-i(\d+)$")
+
+
+def _write_locked(method):
+    """Serialize SQLite writes across processes sharing one trajectory DB."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._write_lock():
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 def _v3_event_coordinates(event_id: str) -> tuple[int, int] | None:
@@ -393,6 +405,7 @@ CREATE TABLE IF NOT EXISTS sidecar_v4_projections (
 class TrajectoryStore:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = str(db_path)
+        self._lock_path = None if self.db_path == ":memory:" else Path(f"{self.db_path}.lock")
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         # Longer timeout is required when two replay workers append audit rows
@@ -435,9 +448,22 @@ class TrajectoryStore:
             self.conn.execute("ALTER TABLE sidecar_v4_edges ADD COLUMN attribute_conflicts_json TEXT NOT NULL DEFAULT '{}'")
         self.conn.commit()
 
+    @contextmanager
+    def _write_lock(self):
+        if self._lock_path is None:
+            yield
+            return
+        with self._lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def close(self) -> None:
         self.conn.close()
 
+    @_write_locked
     def start_run(self, run_id: str, config: dict[str, Any]) -> None:
         with self.conn:
             self.conn.execute(
@@ -461,6 +487,7 @@ class TrajectoryStore:
         ).fetchall()
         return {row["question_id"] for row in rows}
 
+    @_write_locked
     def start_sample(
         self,
         run_id: str,
@@ -493,6 +520,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def finish_sample(self, sample_id: int, status: str, **fields: Any) -> None:
         if not all(name.isidentifier() for name in fields):
             raise ValueError(f"invalid column names: {sorted(fields)}")
@@ -503,6 +531,7 @@ class TrajectoryStore:
                 (status, time.time(), *fields.values(), sample_id),
             )
 
+    @_write_locked
     def record_call(
         self,
         sample_id: int,
@@ -539,6 +568,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def record_state(
         self,
         sample_id: int,
@@ -572,6 +602,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def record_sidecar_event(
         self,
         sample_id: int,
@@ -615,6 +646,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def record_sidecar_state(
         self,
         sample_id: int,
@@ -632,6 +664,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def record_sidecar_context(
         self,
         sample_id: int,
@@ -668,6 +701,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def sync_sidecar_memory(self, sample_id: int, records: Iterable[dict[str, Any]]) -> None:
         """将完整 MemoryState 同步到该 sample 的长期记忆库。
 
@@ -734,6 +768,7 @@ class TrajectoryStore:
         return records
 
     # V3 persistence -----------------------------------------------------
+    @_write_locked
     def record_v3_batch(
         self,
         sample_id: int,
@@ -846,6 +881,7 @@ class TrajectoryStore:
         return records
 
     # V4 persistence -----------------------------------------------------
+    @_write_locked
     def record_v4_batch(
         self,
         sample_id: int,
@@ -958,6 +994,7 @@ class TrajectoryStore:
             for row in rows
         ]
 
+    @_write_locked
     def record_v4_projection(
         self,
         sample_id: int,
@@ -984,6 +1021,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def record_v3_metrics(self, sample_id: int, metrics: dict[str, Any]) -> None:
         with self.conn:
             self.conn.execute(
@@ -992,6 +1030,7 @@ class TrajectoryStore:
                 (sample_id, json.dumps(metrics, ensure_ascii=False, sort_keys=True), time.time()),
             )
 
+    @_write_locked
     def record_v3_compaction(
         self,
         sample_id: int,
@@ -1066,6 +1105,7 @@ class TrajectoryStore:
         return self.load_sidecar_memory_v3(int(row["id"])) if row is not None else None
 
     # V2 persistence -----------------------------------------------------
+    @_write_locked
     def record_sidecar_batch(
         self,
         sample_id: int,
@@ -1087,6 +1127,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def record_sidecar_event_item(
         self,
         batch_id: int,
@@ -1109,6 +1150,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def sync_sidecar_memory_v2(self, sample_id: int, records: Iterable[dict[str, Any]]) -> None:
         """Upsert immutable V2 versions without deleting superseded history."""
         with self.conn:
@@ -1145,6 +1187,7 @@ class TrajectoryStore:
             "superseded_by_record_ref": row["superseded_by_record_ref"],
         } for row in rows]
 
+    @_write_locked
     def record_sidecar_state_v2(self, sample_id: int, *, batch_ordinal: int, state_json: str, state_sha256: str) -> None:
         with self.conn:
             self.conn.execute(
@@ -1152,6 +1195,7 @@ class TrajectoryStore:
                 (sample_id, batch_ordinal, state_json, state_sha256, time.time()),
             )
 
+    @_write_locked
     def record_sidecar_reconciliation_batch(
         self, sample_id: int, *, memory_before_json: str, raw_response: str | None,
         parse_status: str, state_after_json: str | None = None, state_after_sha256: str | None = None,
@@ -1164,6 +1208,7 @@ class TrajectoryStore:
             )
         return int(cursor.lastrowid)
 
+    @_write_locked
     def record_sidecar_reconciliation_item(
         self, batch_id: int, *, group_ordinal: int, model_group: Any,
         route_status: str, route_result: Any = None, created_record_ref: str | None = None,
