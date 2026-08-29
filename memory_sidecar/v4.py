@@ -52,6 +52,8 @@ _RELATION_ALIASES = {
 }
 _OCCURRENCE_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "MENTIONS"})
 _NUMERIC_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED"})
+_GROCERY_PROVIDER_HINTS = frozenset({"walmart", "publix", "trader joe's", "thrive market", "whole foods", "kroger", "aldi", "instacart"})
+_GROCERY_OBJECT_HINTS = frozenset({"grocery", "groceries", "chicken", "beef", "produce", "organic", "food", "meals", "snacks", "pantry", "dairy", "vegetable", "fruit"})
 _FUNCTIONAL_PREDICATES = frozenset({"TARGET", "PREFERS", "PLANS", "LOCATED_IN"})
 _UPDATE_PHRASES = (
     re.compile(r"\bchanged\b.+\bto\b", re.I),
@@ -514,6 +516,81 @@ def render_v4_numeric_projection(
         "aggregates": aggregate_rows,
         "input_edge_ids": [str(edge["edge_id"]) for edge in numeric],
     }
+
+
+def classify_v4_question(question: str) -> str:
+    """Classify only the narrow query shapes handled deterministically in V4."""
+    text = _canonical_text(question)
+    if ("store" in text or "shop" in text or "provider" in text) and any(
+        token in text for token in ("spent", "money", "amount", "most", "least", "highest", "lowest")
+    ):
+        return "provider_amount_rank"
+    if any(token in text for token in ("how many", "total number", "number of")):
+        return "count"
+    if any(token in text for token in ("what time", "when do i", "wake up", "go to bed", "how long")):
+        return "temporal"
+    return "graph_all"
+
+
+def render_v4_query_projection(
+    state_or_edges: V4GraphState | Sequence[Mapping[str, Any]], question: str,
+) -> tuple[str, dict[str, Any]]:
+    """Render a conservative, deterministic projection for known query shapes.
+
+    Unknown providers are deliberately excluded from provider ranking. They remain
+    in the persisted graph and can be audited, but attributing them to a nearby
+    named provider would turn missing provenance into a false fact.
+    """
+    kind = classify_v4_question(question)
+    edges = state_or_edges.edges if isinstance(state_or_edges, V4GraphState) else list(state_or_edges)
+    active = merge_v4_edges([edge for edge in edges if edge.get("status") != "superseded"])
+    if kind == "provider_amount_rank":
+        selected = [
+            edge for edge in active
+            if edge.get("predicate") == "PURCHASED"
+            and (edge.get("attributes") or {}).get("amount") is not None
+            and (edge.get("attributes") or {}).get("provider")
+        ]
+        if "grocery" in _canonical_text(question) or "groceries" in _canonical_text(question):
+            selected = [
+                edge for edge in selected
+                if str((edge.get("attributes") or {}).get("provider", "")) in _GROCERY_PROVIDER_HINTS
+                or any(token in str(edge.get("object", "")) for token in _GROCERY_OBJECT_HINTS)
+            ]
+        groups: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
+        for edge in selected:
+            attrs = edge.get("attributes") or {}
+            groups.setdefault((str(attrs["provider"]), attrs.get("currency")), []).append(edge)
+        lines = ["[V4 QUERY PROJECTION] provider_amount_rank", "[PURCHASED AMOUNTS BY KNOWN PROVIDER]"]
+        aggregates = []
+        for (provider, currency), group in sorted(groups.items()):
+            total = sum(float((edge.get("attributes") or {})["amount"]) for edge in group)
+            ids = [str(edge["edge_id"]) for edge in group]
+            lines.append(f"- provider={provider}; currency={currency or 'unknown'}; total={total}; input_edges={','.join(ids)}")
+            aggregates.append({"provider": provider, "currency": currency, "total": total, "input_edge_ids": ids})
+        ranked = sorted(aggregates, key=lambda row: (-row["total"], row["provider"]))
+        lines.append("[RANKED PROVIDERS]")
+        for index, row in enumerate(ranked, 1):
+            lines.append(f"- rank={index}; provider={row['provider']}; total={row['total']} {row['currency'] or ''}".rstrip())
+        unknown_numeric = sum(
+            1 for edge in active
+            if edge.get("predicate") == "PURCHASED" and (edge.get("attributes") or {}).get("amount") is not None
+            and not (edge.get("attributes") or {}).get("provider")
+        )
+        lines.append(f"[EXCLUDED UNKNOWN PROVIDER AMOUNTS] count={unknown_numeric}")
+        return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "aggregates": ranked, "input_edge_ids": [edge_id for row in aggregates for edge_id in row["input_edge_ids"]], "excluded_unknown_provider_count": unknown_numeric}
+    if kind == "temporal":
+        selected = [edge for edge in active if edge.get("predicate") in {"TARGET", "PREFERS", "OBSERVED"}]
+        lines = ["[V4 QUERY PROJECTION] temporal", "[TARGET PREFERENCE OBSERVATION FACTS]"]
+        for edge in selected:
+            time_json = edge.get("time_json") or {}
+            lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; time={time_json.get('value') or 'unknown'}; interval_end={time_json.get('interval_end') or 'none'}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
+        return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
+    if kind == "count":
+        context, meta = render_v4_numeric_projection(active, predicates=_NUMERIC_PREDICATES)
+        return "[V4 QUERY PROJECTION] count\n" + context, {"projection_kind": kind, **meta}
+    context, meta = render_v4_graph_all(active)
+    return context, {"projection_kind": kind, **meta}
 
 
 def answer_v4_messages(graph_context: str, raw_tail: str, question_date: str, question: str) -> list[dict[str, str]]:

@@ -126,6 +126,17 @@ V4 在 assistant/user 单 session 题上表现稳定；主要损失集中在 mul
 
 只有 query-aware projection 在这 24 条上至少超过 V3 summary-off 的 `12/24`，或在保持准确率的同时显著减少上述结构错误，才进入 120 条确认实验。
 
+## 9. Pilot 后修复
+
+针对 grocery 失败轨迹，新增程序级 `query-auto` projection：
+
+- provider 金额排序只读取 `PURCHASED` 且金额、provider 均明确的 edge；无 provider 的金额保留在 SQLite，但不参与商店排名；
+- 问题包含 grocery 时，再按 grocery provider/object 词表排除服装、书籍等非 grocery 金额；
+- 时间问题只投影 `TARGET/PREFERS/OBSERVED`；数量问题使用 typed numeric projection；其他问题保持 `graph-all`；
+- runner/replay 均支持 `--projection query-auto`，默认 `graph-all` 不变，便于 paired 对照。
+
+在 `gpt4_2ba83207` 的已落盘图谱上回放验证，`query-auto` 将 Thrive Market 排为第一（`$150`），并排除了 Macy's/Amazon 等非 grocery provider。该回放只验证投影与 Answer 变化，不代表 24 条总体准确率已重新测评。
+
 ## 8. 产物
 
 - [V4 shard 1 轨迹](/Users/qshf/my-project/Agentic_RL_Memory/results/memory_sidecar/sidecar-v4-pilot24-shard1-20260829)

@@ -22,6 +22,7 @@ from memory_sidecar.v4 import (
     parse_v4_manager_response,
     render_v4_graph_all,
     render_v4_numeric_projection,
+    render_v4_query_projection,
 )
 from utils.client import ApiError, QwenClient
 from utils.config import DEFAULT_BASE_URL, DEFAULT_MODEL, ModelConfig, ROOT, sha256_text
@@ -52,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-tail-budget", type=int, default=16 * 1024)
     parser.add_argument(
         "--projection",
-        choices=("graph-all", "numeric-all"),
+        choices=("graph-all", "numeric-all", "query-auto"),
         default="graph-all",
         help="Answer projection arm. numeric-all renders unfiltered numeric facts and aggregates only.",
     )
@@ -175,7 +176,7 @@ def main() -> None:
                 projection_kind = "graph_all"
                 projection_filter = {"kind": "all"}
                 projection_edges = [edge for edge in state.edges if edge.get("status") != "superseded"]
-            else:
+            elif args.projection == "numeric-all":
                 graph_context, projection_meta = render_v4_numeric_projection(state)
                 projection_kind = "numeric_all"
                 projection_filter = {
@@ -184,6 +185,12 @@ def main() -> None:
                     "aggregate_count": projection_meta["aggregate_count"],
                 }
                 projection_edge_ids = set(projection_meta["input_edge_ids"])
+                projection_edges = [edge for edge in state.edges if str(edge.get("edge_id")) in projection_edge_ids]
+            else:
+                graph_context, projection_meta = render_v4_query_projection(state, row["question"])
+                projection_kind = f"query_auto_{projection_meta['projection_kind']}"
+                projection_filter = {"kind": "query_auto", "query_shape": projection_meta["projection_kind"]}
+                projection_edge_ids = set(projection_meta.get("input_edge_ids", []))
                 projection_edges = [edge for edge in state.edges if str(edge.get("edge_id")) in projection_edge_ids]
             store.record_v4_projection(
                 sample_id, projection_ordinal=1, projection_kind=projection_kind,

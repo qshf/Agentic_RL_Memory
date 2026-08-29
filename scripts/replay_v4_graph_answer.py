@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from memory_sidecar.data import load_baseline_tail
-from memory_sidecar.v4 import V4GraphState, answer_v4_messages, render_v4_graph_all, render_v4_numeric_projection
+from memory_sidecar.v4 import V4GraphState, answer_v4_messages, render_v4_graph_all, render_v4_numeric_projection, render_v4_query_projection
 from utils.client import QwenClient
 from utils.config import DEFAULT_BASE_URL, DEFAULT_MODEL, ModelConfig, ROOT
 from utils.dataset import load_source
@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--baseline-db", type=Path, default=ROOT / "results/rolling_summary/rolling-summary-eval120-v1-atomic-c2/trajectory.sqlite3")
     parser.add_argument("--baseline-run-id", default="rolling-summary-eval120-v1-atomic-c2")
     parser.add_argument("--raw-tail-budget", type=int, default=16 * 1024)
-    parser.add_argument("--projection", choices=("graph-all", "numeric-all"), default="graph-all")
+    parser.add_argument("--projection", choices=("graph-all", "numeric-all", "query-auto"), default="graph-all")
     parser.add_argument("--answer-max-tokens", type=int, default=1024)
     parser.add_argument("--base-url", default=os.environ.get("QWEN38_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--model", default=os.environ.get("QWEN38_MODEL", DEFAULT_MODEL))
@@ -57,12 +57,13 @@ def main() -> None:
         state = V4GraphState(edges=store.load_v4_edges(sample_id))
         for raw in store.conn.execute("select claim_json,source_refs_json,normalization_actions_json from sidecar_v4_raw_claims where sample_id=? order by id", (sample_id,)):
             state.raw_claims.append({"model_claim": json.loads(raw["claim_json"]), "source_refs": json.loads(raw["source_refs_json"]), "normalization_actions": json.loads(raw["normalization_actions_json"])})
+        row = source[question_id]
         if args.projection == "graph-all":
             graph_context, meta = render_v4_graph_all(state)
             projection_kind = "graph_all_replay_merged_raw"
             projection_filter = {"kind": "all", "replay": True}
             input_edge_ids = [str(edge["edge_id"]) for edge in state.edges if edge.get("status") != "superseded"]
-        else:
+        elif args.projection == "numeric-all":
             graph_context, meta = render_v4_numeric_projection(state)
             projection_kind = "numeric_all_replay"
             projection_filter = {
@@ -72,8 +73,12 @@ def main() -> None:
                 "aggregate_count": meta["aggregate_count"],
             }
             input_edge_ids = meta["input_edge_ids"]
+        else:
+            graph_context, meta = render_v4_query_projection(state, row["question"])
+            projection_kind = f"query_auto_{meta['projection_kind']}"
+            projection_filter = {"kind": "query_auto", "query_shape": meta["projection_kind"], "replay": True}
+            input_edge_ids = meta.get("input_edge_ids", [])
         tail = load_baseline_tail(args.baseline_db, args.baseline_run_id, question_id, args.raw_tail_budget, tokenizer)
-        row = source[question_id]
         prompt = answer_v4_messages(graph_context, tail["raw_tail"], row["question_date"], row["question"])
         answer = client.chat(prompt, max_tokens=args.answer_max_tokens)
         next_call = int(store.conn.execute("select coalesce(max(call_ordinal),0)+1 from calls where sample_id=?", (sample_id,)).fetchone()[0])

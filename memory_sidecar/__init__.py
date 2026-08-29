@@ -47,6 +47,8 @@ from .v4 import (
     parse_v4_manager_response,
     render_v4_graph_all,
     render_v4_numeric_projection,
+    render_v4_query_projection,
+    classify_v4_question,
 )
 
 __all__ = [
@@ -92,5 +94,7 @@ __all__ = [
     "merge_v4_edges",
     "render_v4_graph_all",
     "render_v4_numeric_projection",
+    "render_v4_query_projection",
+    "classify_v4_question",
     "answer_v4_messages",
 ]

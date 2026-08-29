@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 
 from memory_sidecar.v3 import compile_evidence
-from memory_sidecar.v4 import V4GraphState, manager_v4_messages, normalize_v4_claim, parse_v4_manager_response, render_v4_graph_all, render_v4_numeric_projection
+from memory_sidecar.v4 import V4GraphState, classify_v4_question, manager_v4_messages, normalize_v4_claim, parse_v4_manager_response, render_v4_graph_all, render_v4_numeric_projection, render_v4_query_projection
 from utils.store import TrajectoryStore
 
 
@@ -229,6 +229,42 @@ def test_numeric_projection_emits_auditable_unfiltered_aggregates():
     assert "SUM_COUNT COMPLETED; provider=coursera; total=12" in context
     assert meta["numeric_edge_count"] == 1
     assert meta["aggregates"][0]["input_edge_ids"] == [state.edges[0]["edge_id"]]
+
+
+def test_query_projection_ranks_known_purchase_providers_only():
+    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I bought groceries.")])
+    claims = [
+        _claim(object_text="groceries", hints={"amount_text": "$120", "provider_text": "Walmart", "time_text": "last Saturday"}),
+        _claim(object_text="organic products", hints={"amount_text": "$150", "provider_text": "Thrive Market", "time_text": "last month"}),
+        _claim(object_text="a plan budget", relation="plans", hints={"amount_text": "$5000"}),
+    ]
+    state = V4GraphState()
+    for ordinal, payload in enumerate(claims):
+        claim = parse_v4_manager_response(json.dumps({"claims": [payload]}), compiled)[0]
+        state.route(normalize_v4_claim(claim, compiled, ordinal=ordinal))
+    question = "Which grocery store did I spend the most money at in the past month?"
+    assert classify_v4_question(question) == "provider_amount_rank"
+    context, meta = render_v4_query_projection(state, question)
+    assert "rank=1; provider=thrive market; total=150.0" in context
+    assert "provider=walmart; total=120.0" in context
+    assert "5000" not in context
+    assert meta["selected_edge_count"] == 2
+
+
+def test_query_projection_excludes_non_grocery_amounts_for_grocery_question():
+    compiled = compile_evidence([SimpleNamespace(unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user", content="I bought groceries.")])
+    claims = [
+        _claim(object_text="groceries", hints={"amount_text": "$120", "provider_text": "Walmart", "time_text": "last Saturday"}),
+        _claim(object_text="brown boots", hints={"amount_text": "$130", "provider_text": "Macy's", "time_text": "last month"}),
+    ]
+    state = V4GraphState()
+    for ordinal, payload in enumerate(claims):
+        claim = parse_v4_manager_response(json.dumps({"claims": [payload]}), compiled)[0]
+        state.route(normalize_v4_claim(claim, compiled, ordinal=ordinal))
+    context, meta = render_v4_query_projection(state, "Which grocery store did I spend the most money at?")
+    assert "provider=walmart" in context
+    assert "macy's" not in context
+    assert meta["selected_edge_count"] == 1
 
 
 def test_manager_prompt_does_not_embed_growing_graph_state():
