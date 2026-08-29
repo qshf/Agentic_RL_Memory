@@ -81,6 +81,16 @@ def test_invalid_optional_fields_do_not_change_normalization():
     }
 
 
+def test_provider_hint_selects_nearest_amount_when_sentence_has_multiple_amounts():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/05/27", role="user",
+        content="I am buying a $325,000 house, and got pre-approved for $350,000 from Wells Fargo.",
+    )])
+    claim = _claim(relation="uses", object_text="Wells Fargo", evidence_ids=[0], hints={"provider_text": "Wells Fargo"})
+    normalized = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [claim]}), compiled)[0], compiled, ordinal=0)
+    assert normalized.attributes["amount"] == 350000.0
+
+
 def test_occurrence_key_uses_normalized_fields_and_deduplicates():
     compiled = _compiled()
     first = normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [_claim(hints={"time_text": "2023-05-20"})]}), compiled)[0], compiled, ordinal=0)

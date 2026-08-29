@@ -256,6 +256,14 @@ def _parse_attributes(source_text: str, hints: Mapping[str, str | None]) -> tupl
     actions: list[dict[str, Any]] = []
     amount_text = hints.get("amount_text")
     match = _AMOUNT.search(amount_text or source_text)
+    if not amount_text and hints.get("provider_text"):
+        # A sentence may contain both an item price and a provider-specific
+        # amount (e.g. house price vs. mortgage pre-approval). Associate the
+        # amount closest to the cited provider instead of taking the first one.
+        provider_match = re.search(re.escape(str(hints["provider_text"])), source_text, flags=re.I)
+        candidates = list(_AMOUNT.finditer(source_text))
+        if provider_match and candidates:
+            match = min(candidates, key=lambda candidate: abs(candidate.start() - provider_match.start()))
     attributes: dict[str, Any] = {"amount": None, "currency": None, "count": None, "provider": None, "location": None}
     if match:
         attributes["amount"] = float(match.group("amount").replace(",", ""))
