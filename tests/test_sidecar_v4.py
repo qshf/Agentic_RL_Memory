@@ -332,6 +332,28 @@ def test_manager_state_caps_edges_and_keeps_truncation_marker():
     assert rendered["active_edge_count"] == 3
 
 
+def test_manager_state_prefers_edges_relevant_to_current_chunk():
+    state = V4GraphState(edges=[
+        {
+            "edge_id": "old-relevant", "occurrence_key": "occ-old", "status": "completed",
+            "subject": "user", "predicate": "PURCHASED", "object": "midnight sky",
+            "attributes": {"provider": "the whiskey wanderers"}, "source_refs": [],
+        },
+        *[
+            {
+                "edge_id": f"new-{index}", "occurrence_key": f"occ-new-{index}", "status": "completed",
+                "subject": "user", "predicate": "PLANS", "object": f"unrelated plan {index}",
+                "attributes": {}, "source_refs": [],
+            }
+            for index in range(40)
+        ],
+    ])
+    rendered = json.loads(render_v4_manager_state(state, max_edges=4, current_text="I downloaded the Midnight Sky EP again."))
+    assert any(edge["object"] == "midnight sky" for edge in rendered["edges"])
+    assert rendered["selection_mode"] == "lexical_relevance_then_recency"
+    assert rendered["relevant_edge_count"] >= 1
+
+
 def test_manager_prompt_does_not_embed_growing_graph_state():
     prompt = manager_v4_messages(
         V4GraphState(edges=[{"edge_id": "old", "object": "must not enter the prompt"}]),

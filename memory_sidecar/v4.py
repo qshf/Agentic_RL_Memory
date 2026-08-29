@@ -797,6 +797,7 @@ def _claim_audit(claim: NormalizedV4Claim) -> dict[str, Any]:
 
 def render_v4_manager_state(
     state: V4GraphState, *, max_edges: int = 32, max_raw_claims: int = 8,
+    current_text: str = "",
 ) -> str:
     """Render a bounded graph view for the next extraction call.
 
@@ -807,18 +808,29 @@ def render_v4_manager_state(
     if max_edges < 0 or max_raw_claims < 0:
         raise ValueError("manager graph limits must be non-negative")
     active_edges = [edge for edge in state.edges if edge.get("status") != "superseded"]
-    # Keep the most recently routed edges. Functional edges are moved to the
-    # front so a current value is not hidden by a long occurrence history.
-    functional = [edge for edge in active_edges if edge.get("occurrence_key") is None]
-    occurrences = [edge for edge in active_edges if edge.get("occurrence_key") is not None]
-    if max_edges:
-        # Keep functional state first, then fill remaining slots with newest
-        # occurrences. This preserves update targets even when history is long.
-        functional_view = functional[-max_edges:]
-        remaining = max_edges - len(functional_view)
-        selected_edges = functional_view + (occurrences[-remaining:] if remaining else [])
-    else:
-        selected_edges = []
+    user_evidence = "\n".join(
+        re.findall(r"\[e\d+\]\[user\]\s*(.*?)(?=\n\[e\d+\]\[|\Z)", current_text, flags=re.S)
+    )
+    query_terms = set(re.findall(r"[a-z0-9]+", _canonical_text(user_evidence or current_text)))
+
+    def edge_terms(edge: Mapping[str, Any]) -> set[str]:
+        attrs = edge.get("attributes") or {}
+        values = [edge.get("subject"), edge.get("predicate"), edge.get("object"), attrs.get("provider"), attrs.get("location")]
+        return set(re.findall(r"[a-z0-9]+", _canonical_text(" ".join(str(value) for value in values if value))))
+
+    def relevance(edge: Mapping[str, Any]) -> int:
+        # Ignore one-character/common relation tokens; object/provider overlap
+        # is the useful signal for resolving aliases across chunks.
+        terms = edge_terms(edge)
+        return len((terms & query_terms) - {"user", "the", "and", "or", "to", "in", "of"})
+
+    ranked = sorted(
+        enumerate(active_edges),
+        key=lambda item: (relevance(item[1]), item[1].get("occurrence_key") is None, item[0]),
+        reverse=True,
+    )
+    selected_edges = [edge for _, edge in ranked[:max_edges]] if max_edges else []
+    relevant_edge_count = sum(1 for edge in active_edges if relevance(edge) > 0)
     def compact_edge(edge: Mapping[str, Any]) -> dict[str, Any]:
         attributes = edge.get("attributes") or {}
         time_json = edge.get("time_json") or {}
@@ -852,6 +864,8 @@ def render_v4_manager_state(
             "raw_claims": [compact_raw_claim(claim) for claim in state.raw_claims[-max_raw_claims:]] if max_raw_claims else [],
             "truncated": len(selected_edges) < len(active_edges) or len(state.raw_claims) > max_raw_claims,
             "active_edge_count": len(active_edges),
+            "relevant_edge_count": relevant_edge_count,
+            "selection_mode": "lexical_relevance_then_recency" if current_text else "recency_fallback",
         },
         ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
@@ -859,7 +873,7 @@ def render_v4_manager_state(
 
 def manager_v4_messages(state: V4GraphState, compiled: CompiledEvidence) -> list[dict[str, str]]:
     """Build a graph-aware extraction prompt; routing still owns canonical state."""
-    manager_state = render_v4_manager_state(state)
+    manager_state = render_v4_manager_state(state, current_text=compiled.text)
     system = "You extract durable facts. Return one JSON object only; never answer the final question."
     user = f"""Return exactly one JSON object: {{\"claims\":[...]}}.
 Each claim must contain only these required fields:

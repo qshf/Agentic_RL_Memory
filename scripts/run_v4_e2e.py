@@ -142,7 +142,7 @@ def main() -> None:
         try:
             for chunk_ordinal, current in enumerate(chunks(tuple(stream), args.chunk_budget, tokenizer), 1):
                 compiled = compile_evidence(current)
-                manager_context = render_v4_manager_state(state)
+                manager_context = render_v4_manager_state(state, current_text=compiled.text)
                 before = json.dumps({
                     "edges": state.edges,
                     "raw_claims": state.raw_claims,
