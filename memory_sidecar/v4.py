@@ -58,9 +58,16 @@ _RELATION_ALIASES = {
 }
 _OCCURRENCE_PREDICATES = frozenset({"PURCHASED", "DOWNLOADED", "ATTENDED", "COMPLETED", "OBSERVED", "OBSERVED_WAKE_TIME", "MENTIONS", "USES"})
 _NUMERIC_PREDICATES = frozenset({"PURCHASED", "ATTENDED", "COMPLETED", "OBSERVED", "OBSERVED_WAKE_TIME"})
-_GROCERY_PROVIDER_HINTS = frozenset({"walmart", "publix", "trader joe's", "thrive market", "whole foods", "kroger", "aldi", "instacart"})
-_GROCERY_OBJECT_HINTS = frozenset({"grocery", "groceries", "chicken", "beef", "produce", "organic", "food", "meals", "snacks", "pantry", "dairy", "vegetable", "fruit"})
 _FUNCTIONAL_PREDICATES = frozenset({"TARGET", "PREFERS", "PLANS", "LOCATED_IN"})
+_CATEGORY_HINTS = {
+    "grocery": frozenset({"grocery", "groceries", "chicken", "beef", "produce", "organic", "food", "meal", "snack", "pantry", "dairy", "vegetable", "fruit"}),
+}
+_QUERY_STOPWORDS = frozenset({
+    "what", "which", "where", "when", "how", "many", "much", "did", "do", "i", "my", "the",
+    "a", "an", "of", "to", "in", "on", "at", "for", "from", "and", "or", "is", "are", "was",
+    "were", "have", "has", "had", "been", "be", "between", "past", "last", "total", "number",
+    "most", "least", "highest", "lowest", "money", "spent", "days", "time", "long", "online",
+})
 _UPDATE_PHRASES = (
     re.compile(r"\bchanged\b.+\bto\b", re.I),
     re.compile(r"\bupdated\s+to\b", re.I),
@@ -77,8 +84,6 @@ _COUNT = re.compile(
     r"graduations?|events?|trips?|nights?)\b",
     re.I,
 )
-_COLLECTION_ITEM_OBJECT = re.compile(r"\b(?:coin|quarter|dime|nickel|penny|cent)s?\b", re.I)
-_COLLECTION_COUNT = re.compile(r"(?<![\d-])\b(?P<count>\d+)\s+(?:[A-Za-z0-9-]+\s+){0,4}coins?\b", re.I)
 _MONTH_DATE = re.compile(r"\b(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})\b")
 _ISO_DATE = re.compile(r"\b(?P<year>\d{4})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})\b")
 
@@ -214,17 +219,6 @@ def normalize_v4_claim(
     actions.extend(attribute_actions)
     time_json, time_actions = _parse_time(claim.hints.get("time_text") or raw_text, claim.evidence_ids, compiled)
     actions.extend(time_actions)
-    if predicate == "ATTENDED" and time_json.get("parse_status") == "unparsed":
-        session_dates = {
-            compiled.evidence[evidence_id].session_date
-            for evidence_id in claim.evidence_ids
-            if evidence_id in compiled.evidence and compiled.evidence[evidence_id].session_date
-        }
-        if len(session_dates) == 1:
-            session_date = _parse_session_date(next(iter(session_dates)))
-            if session_date:
-                time_json = _time_day(session_date, relative_to={"reference_date": session_date.isoformat(), "expression": "evidence_session_date"})
-                actions.append({"kind": "event_date_from_session", "output": session_date.isoformat()})
     for field in claim.model_claim.get("_invalid_optional_fields", []):
         actions.append({"kind": "invalid_optional_field", "field": field})
     scope_text = claim.hints.get("scope_text")
@@ -647,6 +641,34 @@ def classify_v4_question(question: str) -> str:
     return "graph_all"
 
 
+def _query_terms(question: str) -> set[str]:
+    """Extract lightweight lexical terms without a dataset/domain vocabulary."""
+    terms = set()
+    for token in re.findall(r"[a-z0-9]+", _canonical_text(question)):
+        if len(token) < 4 or token in _QUERY_STOPWORDS:
+            continue
+        if token.endswith("ies") and len(token) > 4:
+            token = token[:-3] + "y"
+        elif token.endswith("s") and len(token) > 4:
+            token = token[:-1]
+        terms.add(token)
+    return terms
+
+
+def _edge_matches_query(edge: Mapping[str, Any], terms: set[str]) -> bool:
+    attrs = edge.get("attributes") or {}
+    fields = [edge.get("object"), attrs.get("provider"), attrs.get("location"), (edge.get("scope_json") or {}).get("value")]
+    edge_terms = set()
+    for field in fields:
+        for token in re.findall(r"[a-z0-9]+", _canonical_text(str(field or ""))):
+            if token.endswith("ies") and len(token) > 4:
+                token = token[:-3] + "y"
+            elif token.endswith("s") and len(token) > 4:
+                token = token[:-1]
+            edge_terms.add(token)
+    return bool(terms & edge_terms)
+
+
 def render_v4_query_projection(
     state_or_edges: V4GraphState | Sequence[Mapping[str, Any]], question: str,
 ) -> tuple[str, dict[str, Any]]:
@@ -666,12 +688,13 @@ def render_v4_query_projection(
             and (edge.get("attributes") or {}).get("amount") is not None
             and (edge.get("attributes") or {}).get("provider")
         ]
-        if "grocery" in _canonical_text(question) or "groceries" in _canonical_text(question):
-            selected = [
-                edge for edge in selected
-                if str((edge.get("attributes") or {}).get("provider", "")) in _GROCERY_PROVIDER_HINTS
-                or any(token in str(edge.get("object", "")) for token in _GROCERY_OBJECT_HINTS)
-            ]
+        question_terms = _query_terms(question)
+        relevant = [edge for edge in selected if _edge_matches_query(edge, question_terms)]
+        for category, hints in _CATEGORY_HINTS.items():
+            if category in question_terms:
+                relevant = [edge for edge in selected if _edge_matches_query(edge, question_terms | hints)]
+        if relevant:
+            selected = relevant
         groups: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
         for edge in selected:
             attrs = edge.get("attributes") or {}
@@ -699,12 +722,10 @@ def render_v4_query_projection(
             edge for edge in active
             if edge.get("predicate") == "PURCHASED" and (edge.get("attributes") or {}).get("amount") is not None
         ]
-        question_text = _canonical_text(question)
-        if "bike" in question_text or "cycling" in question_text:
-            selected = [
-                edge for edge in selected
-                if any(token in str(edge.get("object", "")) for token in ("bike", "chain", "helmet", "light", "tune-up"))
-            ]
+        question_terms = _query_terms(question)
+        relevant = [edge for edge in selected if _edge_matches_query(edge, question_terms)]
+        if relevant:
+            selected = relevant
         lines = ["[V4 QUERY PROJECTION] amount_total", "[PURCHASED AMOUNTS]"]
         total = 0.0
         for edge in selected:
@@ -715,13 +736,10 @@ def render_v4_query_projection(
         return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "total": total, "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
     if kind == "temporal":
         selected = [edge for edge in active if edge.get("predicate") in {"TARGET", "PREFERS", "OBSERVED", "OBSERVED_WAKE_TIME"}]
-        question_text = _canonical_text(question)
-        if "museum" in question_text or "moma" in question_text or "metropolitan" in question_text:
-            selected = [
-                edge for edge in active
-                if edge.get("predicate") in {"ATTENDED", "OBSERVED"}
-                and any(token in str(edge.get("object", "")) for token in ("museum", "moma", "metropolitan", "civilization", "exhibit"))
-            ]
+        question_terms = _query_terms(question)
+        relevant = [edge for edge in active if edge.get("predicate") in {"ATTENDED", "OBSERVED"} and _edge_matches_query(edge, question_terms)]
+        if relevant:
+            selected = relevant
         if "wake" in _canonical_text(question) or "bed" in _canonical_text(question):
             selected = [
                 edge for edge in selected
@@ -736,48 +754,6 @@ def render_v4_query_projection(
             lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; time={time_value or 'unknown'}; interval_end={time_json.get('interval_end') or 'none'}{status}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
         return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
     if kind == "count":
-        question_text = _canonical_text(question)
-        # Collection questions can contain an old aggregate plus later single
-        # item additions. Expose both deterministic facts to Answer.
-        if "coin" in question_text and ("collection" in question_text or "have" in question_text):
-            collection_edges = []
-            for edge in active:
-                object_text = _canonical_text(str(edge.get("object", "")))
-                scope_text = _canonical_text(str((edge.get("scope_json") or {}).get("value") or ""))
-                is_aggregate = "pre-1920" in object_text and "coin" in object_text
-                is_scoped_item = "pre-1920" in scope_text and _COLLECTION_ITEM_OBJECT.search(object_text)
-                if not (is_aggregate or is_scoped_item):
-                    continue
-                edge_copy = deepcopy(edge)
-                attrs = edge_copy.setdefault("attributes", {})
-                if attrs.get("count") is None:
-                    match = _COLLECTION_COUNT.search(object_text) or _COUNT.search(object_text)
-                    if match:
-                        attrs["count"] = int(match.group("count"))
-                    elif _COLLECTION_ITEM_OBJECT.search(object_text):
-                        attrs["count"] = 1
-                collection_edges.append(edge_copy)
-            if collection_edges:
-                lines = ["[V4 QUERY PROJECTION] count", "[COLLECTION COUNT FACTS]"]
-                total = 0
-                for edge in collection_edges:
-                    attrs = edge.get("attributes") or {}
-                    count = attrs.get("count")
-                    if count is not None:
-                        total += int(count)
-                    lines.append(
-                        f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; "
-                        f"count={count if count is not None else 'unknown'}; "
-                        f"scope={(edge.get('scope_json') or {}).get('value') or 'unknown'}"
-                    )
-                lines.append(f"[COLLECTION COUNT TOTAL] total={total}")
-                return "\n".join(lines), {
-                    "projection_kind": kind,
-                    "selected_edge_count": len(collection_edges),
-                    "count_projection_mode": "collection_aggregate_plus_items",
-                    "total": total,
-                    "input_edge_ids": [str(edge["edge_id"]) for edge in collection_edges],
-                }
         selected = []
         for edge in active:
             if edge.get("predicate") not in _NUMERIC_PREDICATES:
@@ -800,20 +776,8 @@ def render_v4_query_projection(
         # represent each graduation, garment, plant, or album as a separate
         # occurrence without a count attribute. Do not project an empty numeric
         # context; expose the relevant occurrence rows so Answer can count them.
-        question_terms = {
-            token for token in re.findall(r"[a-z0-9]+", _canonical_text(question))
-            if len(token) >= 4 and token not in {"what", "many", "items", "number", "have", "past", "months", "month"}
-        }
+        question_terms = _query_terms(question)
         occurrence_edges = [edge for edge in active if edge.get("predicate") in _OCCURRENCE_PREDICATES]
-        question_text = _canonical_text(question)
-        if "graduat" in question_text:
-            occurrence_edges = [edge for edge in occurrence_edges if edge.get("predicate") == "ATTENDED"]
-        elif "album" in question_text or "ep" in question_text or "music" in question_text:
-            occurrence_edges = [
-                edge for edge in occurrence_edges
-                if edge.get("predicate") in {"PURCHASED", "DOWNLOADED"}
-                and any(token in str(edge.get("object", "")) for token in ("album", "ep", "vinyl", "record", "happier than ever", "tame impala"))
-            ]
         relevant = [
             edge for edge in occurrence_edges
             if question_terms & set(re.findall(r"[a-z0-9]+", _canonical_text(str(edge.get("object", "")))))

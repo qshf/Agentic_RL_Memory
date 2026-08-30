@@ -32,7 +32,9 @@
 轨迹和新轨迹混合统计；若准确率仍为 12/24，再进行 query-aware projection replay，
 最后才决定是否进入 V5 或 120 条确认实验。
 
-## 本轮针对性修复（2026-08-30）
+## 曾尝试但已撤回的样本特化修复（2026-08-30）
+
+本节只保留诊断记录，不属于正式 V4 规则。
 
 ### 硬币集合计数
 
@@ -40,26 +42,36 @@
 `1915-S Barber quarter`。旧 count projection 只读取数值关系，导致 `MENTIONS` 或
 `PLANS` 中的明确数量被漏掉；第一次扩大筛选又把计划动作和其他年代硬币算入，得到 43。
 
-现改为只投影两类事实：
-
-- object 明确包含 `pre-1920 ... coins` 的集合总数；
-- scope 明确为 `pre-1920 American coins` 的单件硬币，程序计数为 1。
-
-已落库 Manager 图谱的离线验证结果为 `37 + 1 = 38`，并记录
-`count_projection_mode=collection_aggregate_plus_items`，不再计入无关事实。
+曾尝试增加只识别 `pre-1920` 和 `coin` 的 projection，并把单件硬币计为 1。该规则
+可以让这个样本得到 38，但依赖测试问题中的具体词汇，属于数据泄露风险，现已从正式 V4
+代码和测试中撤回。正确方向应是通用的集合 scope、快照/增量语义和 evidence 顺序处理。
 
 ### 博物馆访问日期
 
-`gpt4_59149c77` 的第二次访问含 `today`，已按 evidence session date 解析为
-`2023-01-15`。第一次访问原文是“刚从导览回来”，没有显式日期；对唯一 evidence 且
-关系为 `ATTENDED` 的事实，程序使用 session date 作为代理日期，并写入
-`event_date_from_session` 审计动作，使 projection 能保留两次访问及其日期。
+`gpt4_59149c77` 的第二次访问含 `today`，按 evidence session date 解析是通用规则，
+现予保留。曾尝试对所有无显式时间的 `ATTENDED` 事实直接使用 session date；这会把
+会话时间误当成事件时间，现已撤回。后续应分离 `valid_time` 与 `reported_time`，不做
+未经证据支持的事件日期补全。
 
 ### 验证状态
 
-- `tests/test_sidecar_v4.py`: 39 passed。
+- `tests/test_sidecar_v4.py`: 37 passed（撤回两个样本特化测试后）。
 - 两个在线重跑分别写入 59/60 个 Manager batch 和 177/165 条边；上游服务随后长时间无响应，
   因此中止最后一次 Manager 请求。两份数据库保留了已完成 batch 和 graph edges。
-- 复用已落库图谱做 Answer-only 验证：硬币样本输出 `38`；博物馆样本在内存应用本轮
-  `event_date_from_session` 后输出 `7 days`。后者说明修复有效，但要形成正式端到端轨迹，
-  仍需服务恢复后重新完成该样本并把修复后的时间字段写入 SQLite。
+- 复用特化版本图谱做的 Answer-only 结果（硬币 `38`、博物馆 `7 days`）只作为诊断记录，
+  不计入正式 V4 准确率。
+
+## 干净 V4 基线整改
+
+随后在 `2ab3099` 基础上进行了基线清理：
+
+- 删除所有 `coin/pre-1920` 专用数量投影和单件计数规则；
+- 删除无显式时间时针对 `ATTENDED` 的 session-date 事件补全；
+- 保留通用的 `today/yesterday/tomorrow` 相对时间解析；
+- 将问题相关性筛选统一为 object/provider/location/scope 的词汇交集，不再使用
+  museum、bike、course、album 等测试样本名称分支；
+- 关系别名、数量正则、provider 金额关联、occurrence 去重和 SQLite 审计均保持不变。
+
+该版本恢复为可用于正式对比的 V4 baseline。样本特化版本的结果和轨迹不得混入 V4
+准确率统计；后续如需增强集合计数，应新增通用 schema（集合 scope、快照/增量关系和
+证据顺序），并在冻结协议后重新实验。
