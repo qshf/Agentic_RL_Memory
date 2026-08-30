@@ -190,6 +190,25 @@ def test_temporal_projection_keeps_observed_wake_time_without_wake_in_object():
     assert meta["selected_edge_count"] == 1
 
 
+def test_count_projection_falls_back_to_occurrences_when_no_typed_count():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/05/30", role="user",
+        content="I attended my nephew's graduation ceremony and my friend's graduation ceremony.",
+    )])
+    state = V4GraphState()
+    for ordinal, object_text in enumerate(("nephew graduation ceremony", "friend graduation ceremony")):
+        claim = _claim(relation="attended", object_text=object_text, evidence_ids=[0])
+        state.route(normalize_v4_claim(parse_v4_manager_response(json.dumps({"claims": [claim]}), compiled)[0], compiled, ordinal=ordinal))
+    context, meta = render_v4_query_projection(state, "How many graduation ceremonies have I attended?")
+    assert meta["count_projection_mode"] == "occurrence_fallback"
+    assert meta["selected_edge_count"] == 2
+    assert context.count("ATTENDED") == 2
+
+
+def test_temporal_classifier_precedes_generic_count_for_day_difference():
+    assert classify_v4_question("How many days passed between two museum visits?") == "temporal"
+
+
 def test_relative_time_uses_evidence_session_date():
     compiled = _compiled()
     claims = parse_v4_manager_response(json.dumps({"claims": [_claim(hints={"time_text": "previous Saturday"})]}), compiled)
