@@ -58,6 +58,8 @@
 ### 验证状态
 
 - `tests/test_sidecar_v4.py`: 39 passed。
-- 两个在线重跑均完成 Manager 的 38 个 chunk 并写入 SQLite；上游服务随后长时间无响应，
-  因此中止等待，未得到最终 Answer。两份数据库保留了已完成 batch 和 graph edges，可继续
-  做 Answer/replay。
+- 两个在线重跑分别写入 59/60 个 Manager batch 和 177/165 条边；上游服务随后长时间无响应，
+  因此中止最后一次 Manager 请求。两份数据库保留了已完成 batch 和 graph edges。
+- 复用已落库图谱做 Answer-only 验证：硬币样本输出 `38`；博物馆样本在内存应用本轮
+  `event_date_from_session` 后输出 `7 days`。后者说明修复有效，但要形成正式端到端轨迹，
+  仍需服务恢复后重新完成该样本并把修复后的时间字段写入 SQLite。
