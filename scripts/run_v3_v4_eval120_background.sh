@@ -22,7 +22,7 @@ PY
 ) )
 
 echo "[$(date)] V3 start: ${#V3_IDS[@]} missing ids" | tee -a "$LOG_DIR/runner.log"
-python scripts/run_memory_sidecar_strong.py \
+PYTHONUNBUFFERED=1 python -u scripts/run_memory_sidecar_strong.py \
   --manifest "$MANIFEST" --limit 120 --question-id "${V3_IDS[@]}" \
   --source "$SOURCE" --baseline-db "$BASELINE_DB" \
   --baseline-run-id rolling-summary-eval120-v1-atomic-c2 \
@@ -47,7 +47,7 @@ PY
 ) )
 
 echo "[$(date)] V4 start: ${#V4_IDS[@]} missing ids" | tee -a "$LOG_DIR/runner.log"
-python scripts/run_v4_e2e.py \
+PYTHONUNBUFFERED=1 python -u scripts/run_v4_e2e.py \
   --question-id "${V4_IDS[@]}" --projection graph-all \
   --run-id "$V4_RUN" \
   --db "results/memory_sidecar/$V4_RUN/trajectory.sqlite3" \
