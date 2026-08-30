@@ -81,6 +81,18 @@ def test_invalid_optional_fields_do_not_change_normalization():
     }
 
 
+def test_unparsed_time_is_bounded_and_not_canonical():
+    text = "I bought a snack. " + ("This is unrelated context. " * 40)
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="", role="user", content=text,
+    )])
+    claim = parse_v4_manager_response(json.dumps({"claims": [_claim(object_text="snack")]}), compiled)[0]
+    normalized = normalize_v4_claim(claim, compiled, ordinal=0)
+    assert normalized.time_json["parse_status"] == "unparsed"
+    assert normalized.time_json["value"] is None
+    assert len(normalized.time_json["raw"]) <= 256
+
+
 def test_provider_hint_selects_nearest_amount_when_sentence_has_multiple_amounts():
     compiled = compile_evidence([SimpleNamespace(
         unit_ordinal=10, session_id="s", session_date="2023/05/27", role="user",
