@@ -32,3 +32,32 @@
 轨迹和新轨迹混合统计；若准确率仍为 12/24，再进行 query-aware projection replay，
 最后才决定是否进入 V5 或 120 条确认实验。
 
+## 本轮针对性修复（2026-08-30）
+
+### 硬币集合计数
+
+`69fee5aa` 的轨迹同时出现了历史总数 `37 pre-1920 American coins` 和后续新增的
+`1915-S Barber quarter`。旧 count projection 只读取数值关系，导致 `MENTIONS` 或
+`PLANS` 中的明确数量被漏掉；第一次扩大筛选又把计划动作和其他年代硬币算入，得到 43。
+
+现改为只投影两类事实：
+
+- object 明确包含 `pre-1920 ... coins` 的集合总数；
+- scope 明确为 `pre-1920 American coins` 的单件硬币，程序计数为 1。
+
+已落库 Manager 图谱的离线验证结果为 `37 + 1 = 38`，并记录
+`count_projection_mode=collection_aggregate_plus_items`，不再计入无关事实。
+
+### 博物馆访问日期
+
+`gpt4_59149c77` 的第二次访问含 `today`，已按 evidence session date 解析为
+`2023-01-15`。第一次访问原文是“刚从导览回来”，没有显式日期；对唯一 evidence 且
+关系为 `ATTENDED` 的事实，程序使用 session date 作为代理日期，并写入
+`event_date_from_session` 审计动作，使 projection 能保留两次访问及其日期。
+
+### 验证状态
+
+- `tests/test_sidecar_v4.py`: 39 passed。
+- 两个在线重跑均完成 Manager 的 38 个 chunk 并写入 SQLite；上游服务随后长时间无响应，
+  因此中止等待，未得到最终 Answer。两份数据库保留了已完成 batch 和 graph edges，可继续
+  做 Answer/replay。

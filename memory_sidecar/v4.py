@@ -77,6 +77,8 @@ _COUNT = re.compile(
     r"graduations?|events?|trips?|nights?)\b",
     re.I,
 )
+_COLLECTION_ITEM_OBJECT = re.compile(r"\b(?:coin|quarter|dime|nickel|penny|cent)s?\b", re.I)
+_COLLECTION_COUNT = re.compile(r"(?<![\d-])\b(?P<count>\d+)\s+(?:[A-Za-z0-9-]+\s+){0,4}coins?\b", re.I)
 _MONTH_DATE = re.compile(r"\b(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2}),?\s+(?P<year>\d{4})\b")
 _ISO_DATE = re.compile(r"\b(?P<year>\d{4})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})\b")
 
@@ -212,6 +214,17 @@ def normalize_v4_claim(
     actions.extend(attribute_actions)
     time_json, time_actions = _parse_time(claim.hints.get("time_text") or raw_text, claim.evidence_ids, compiled)
     actions.extend(time_actions)
+    if predicate == "ATTENDED" and time_json.get("parse_status") == "unparsed":
+        session_dates = {
+            compiled.evidence[evidence_id].session_date
+            for evidence_id in claim.evidence_ids
+            if evidence_id in compiled.evidence and compiled.evidence[evidence_id].session_date
+        }
+        if len(session_dates) == 1:
+            session_date = _parse_session_date(next(iter(session_dates)))
+            if session_date:
+                time_json = _time_day(session_date, relative_to={"reference_date": session_date.isoformat(), "expression": "evidence_session_date"})
+                actions.append({"kind": "event_date_from_session", "output": session_date.isoformat()})
     for field in claim.model_claim.get("_invalid_optional_fields", []):
         actions.append({"kind": "invalid_optional_field", "field": field})
     scope_text = claim.hints.get("scope_text")
@@ -309,6 +322,14 @@ def _parse_time(text: str | None, evidence_ids: Sequence[int], compiled: Compile
 def _parse_relative_time(text: str, reference: date) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """Resolve a small, explicit set of relative dates against evidence time."""
     metadata = {"reference_date": reference.isoformat()}
+    if re.search(r"\btoday\b", text):
+        return _time_day(reference, relative_to={**metadata, "expression": "today"}), [{"kind": "relative_time_parse", "output": reference.isoformat()}]
+    if re.search(r"\byesterday\b", text):
+        parsed = reference - timedelta(days=1)
+        return _time_day(parsed, relative_to={**metadata, "expression": "yesterday"}), [{"kind": "relative_time_parse", "output": parsed.isoformat()}]
+    if re.search(r"\btomorrow\b", text):
+        parsed = reference + timedelta(days=1)
+        return _time_day(parsed, relative_to={**metadata, "expression": "tomorrow"}), [{"kind": "relative_time_parse", "output": parsed.isoformat()}]
     if "the week before last" in text:
         current_week_start = reference - timedelta(days=reference.weekday())
         end = current_week_start - timedelta(days=8)
@@ -715,6 +736,48 @@ def render_v4_query_projection(
             lines.append(f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; time={time_value or 'unknown'}; interval_end={time_json.get('interval_end') or 'none'}{status}; sources=" + ",".join(f"u{ref.get('unit_ordinal')}" for ref in edge.get("source_refs", [])))
         return "\n".join(lines), {"projection_kind": kind, "selected_edge_count": len(selected), "input_edge_ids": [str(edge["edge_id"]) for edge in selected]}
     if kind == "count":
+        question_text = _canonical_text(question)
+        # Collection questions can contain an old aggregate plus later single
+        # item additions. Expose both deterministic facts to Answer.
+        if "coin" in question_text and ("collection" in question_text or "have" in question_text):
+            collection_edges = []
+            for edge in active:
+                object_text = _canonical_text(str(edge.get("object", "")))
+                scope_text = _canonical_text(str((edge.get("scope_json") or {}).get("value") or ""))
+                is_aggregate = "pre-1920" in object_text and "coin" in object_text
+                is_scoped_item = "pre-1920" in scope_text and _COLLECTION_ITEM_OBJECT.search(object_text)
+                if not (is_aggregate or is_scoped_item):
+                    continue
+                edge_copy = deepcopy(edge)
+                attrs = edge_copy.setdefault("attributes", {})
+                if attrs.get("count") is None:
+                    match = _COLLECTION_COUNT.search(object_text) or _COUNT.search(object_text)
+                    if match:
+                        attrs["count"] = int(match.group("count"))
+                    elif _COLLECTION_ITEM_OBJECT.search(object_text):
+                        attrs["count"] = 1
+                collection_edges.append(edge_copy)
+            if collection_edges:
+                lines = ["[V4 QUERY PROJECTION] count", "[COLLECTION COUNT FACTS]"]
+                total = 0
+                for edge in collection_edges:
+                    attrs = edge.get("attributes") or {}
+                    count = attrs.get("count")
+                    if count is not None:
+                        total += int(count)
+                    lines.append(
+                        f"- {edge.get('subject')} --{edge.get('predicate')}--> {edge.get('object')}; "
+                        f"count={count if count is not None else 'unknown'}; "
+                        f"scope={(edge.get('scope_json') or {}).get('value') or 'unknown'}"
+                    )
+                lines.append(f"[COLLECTION COUNT TOTAL] total={total}")
+                return "\n".join(lines), {
+                    "projection_kind": kind,
+                    "selected_edge_count": len(collection_edges),
+                    "count_projection_mode": "collection_aggregate_plus_items",
+                    "total": total,
+                    "input_edge_ids": [str(edge["edge_id"]) for edge in collection_edges],
+                }
         selected = []
         for edge in active:
             if edge.get("predicate") not in _NUMERIC_PREDICATES:

@@ -233,6 +233,46 @@ def test_relative_time_parses_week_month_and_last_saturday_intervals():
         assert (normalized.time_json["value"], normalized.time_json["interval_end"], normalized.time_json["granularity"]) == expected
 
 
+def test_today_resolves_against_evidence_session_date():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/06/03", role="user",
+        content="I visited the museum today.",
+    )])
+    claim = parse_v4_manager_response(json.dumps({"claims": [_claim(
+        relation="attended", object_text="museum", hints={"time_text": "today"},
+    )]}), compiled)[0]
+    normalized = normalize_v4_claim(claim, compiled, ordinal=0)
+    assert normalized.time_json["value"] == "2023-06-03"
+    assert normalized.time_json["relative_to"]["reference_date"] == "2023-06-03"
+
+
+def test_attended_without_explicit_date_uses_single_evidence_session_date():
+    compiled = compile_evidence([SimpleNamespace(
+        unit_ordinal=10, session_id="s", session_date="2023/06/03", role="user",
+        content="I just got back from a guided tour at the museum.",
+    )])
+    claim = parse_v4_manager_response(json.dumps({"claims": [_claim(
+        relation="attended", object_text="guided tour at the museum",
+    )]}), compiled)[0]
+    normalized = normalize_v4_claim(claim, compiled, ordinal=0)
+    assert normalized.time_json["value"] == "2023-06-03"
+    assert any(action["kind"] == "event_date_from_session" for action in normalized.normalization_actions)
+
+
+def test_coin_collection_projection_combines_aggregate_and_single_item():
+    state = V4GraphState()
+    state.edges = [
+        {"edge_id": "a", "predicate": "MENTIONS", "subject": "user", "object": "37 pre-1920 american coins",
+         "attributes": {"count": None}, "scope_json": {"value": None}, "status": "active", "source_refs": []},
+        {"edge_id": "b", "predicate": "MENTIONS", "subject": "user", "object": "1915-s barber quarter",
+         "attributes": {"count": None}, "scope_json": {"value": "collection of pre-1920 american coins"}, "status": "active", "source_refs": []},
+    ]
+    context, meta = render_v4_query_projection(state, "How many pre-1920 American coins do I have in my collection?")
+    assert meta["count_projection_mode"] == "collection_aggregate_plus_items"
+    assert meta["total"] == 38
+    assert "total=38" in context
+
+
 def test_provider_suffix_alias_merges_same_evidence_numeric_occurrence():
     compiled = compile_evidence([SimpleNamespace(
         unit_ordinal=10, session_id="s", session_date="2023/05/15", role="user",
