@@ -53,3 +53,20 @@
 `gpt4_2ba83207`、`81507db6`、`gpt4_d6585ce9` 和 `gpt4_59149c77`。随后单独在线重跑
 `852ce960`，确认金额选择修复能否改变最终答案；不要立即扩大到 120 条。
 
+## 后续回放结果
+
+在同一批持久化 graph 上运行 `query-auto` 后：
+
+- `gpt4_2ba83207` 从 Walmart 修复为 **Thrive Market**，证明 provider projection 有效；
+- `81507db6` 的 occurrence fallback 能看到 3 个 `ATTENDED` 毕业事件，但 Answer 仍可能
+  受时间文本影响；
+- `bf659f65` 的 occurrence fallback 保留 3 个专辑/EP 相关边，但当前 Answer 仍只答 1，
+  说明投影筛选还需继续收紧；
+- `69fee5aa` 仍只有 1 条相关 count occurrence，图谱中没有 `38`，更像 Manager 抽取遗漏；
+- `gpt4_59149c77` 已从 generic count 改为 temporal projection，但 Manager 仍未把两个
+  博物馆访问规范化成可计算日期；
+- 最新代码在线重跑 `852ce960` 后回答 **`$350,000`**，修复生效。
+
+因此下一步优先级是：先修 Manager 对 coin count 和 museum date 的抽取，再对 count/temporal
+projection 做小范围回放；provider 金额问题已通过 query-aware projection 解决，不再继续
+扩大 graph-all。
