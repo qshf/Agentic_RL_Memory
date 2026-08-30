@@ -381,7 +381,11 @@ def _time_interval(start: date, end: date, granularity: str, *, relative_to: dic
 
 
 def _unparsed_time(raw: str | None, *, status: str = "unparsed") -> dict[str, Any]:
-    return {"value": raw, "granularity": "unknown", "timezone": None, "interval_end": None, "recurrence": None, "relative_to": None, "parse_status": status}
+    # An unparsed value is not a canonical time and must never participate in
+    # occurrence identity or be rendered as the full evidence/question text.
+    # Keep only a bounded audit hint for diagnosis.
+    raw_hint = _SPACE.sub(" ", str(raw)).strip()[:256] if raw else None
+    return {"value": None, "raw": raw_hint, "granularity": "unknown", "timezone": None, "interval_end": None, "recurrence": None, "relative_to": None, "parse_status": status}
 
 
 def _update_intent(raw_text: str) -> str:
