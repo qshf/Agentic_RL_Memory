@@ -30,7 +30,7 @@ PYTHONUNBUFFERED=1 python -u scripts/run_memory_sidecar_strong.py \
   --protocol v3 --chunk-budget-tokens 2048 \
   --manager-context-budget-tokens 12288 --active-memory-budget-tokens 8192 \
   --update-ledger-budget-tokens 2048 --recent-tail-budget-tokens 16384 \
-  --shared-context-budget-tokens 81920 --max-concurrency 4 \
+  --shared-context-budget-tokens 81920 --max-concurrency 2 \
   --compactor off --answer-max-tokens 1024 \
   >> "$LOG_DIR/v3.log" 2>&1
 
