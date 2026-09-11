@@ -62,7 +62,7 @@
 
 V1 Rolling Summary 已作为冻结基线，结果和错误归因记录在：
 
-- `docs/plan/2026-08-21_rolling_summary_baseline_v1_evaluation.md`
+- [Rolling Summary Baseline V1 评估记录](../../baseline/rolling-summary/v1/2026-08-21_rolling_summary_baseline_v1_evaluation.md)
 - run `rolling-summary-eval120-v1-atomic-c2`
 
 ## 2. V1 基线给出的实验动机
@@ -92,7 +92,7 @@ V1 的 120 条样本结果为 73/120，DeepSeek judge 准确率 60.83%。人工�
 - `UPDATE`：已有事实发生时间、状态或值变化；旧版本标记为 `superseded`，新版本追加为当前记录；
 - `NOOP`：没有值得长期保留的信息。
 
-V1 已知缺陷：当前实现对已有 active key 的不同 value `ADD` 直接返回 `rejected_add_conflict`，不会自动判断是补充还是替换；旧值继续 active，新候选只保留在事件审计中。下一版的冲突路由方案（包括 `merge`、`UPDATE`、`conflict_pending`，以及 superseded 旧值是否进入 Answer 投影）单独记录在：[Memory Sidecar Memory Conflict 修复方案](2026-08-23_memory_sidecar_memory_conflict_resolution_v1.md)。
+V1 已知缺陷：当前实现对已有 active key 的不同 value `ADD` 直接返回 `rejected_add_conflict`，不会自动判断是补充还是替换；旧值继续 active，新候选只保留在事件审计中。下一版的冲突路由方案（包括 `merge`、`UPDATE`、`conflict_pending`，以及 superseded 旧值是否进入 Answer 投影）曾单独记录在“Memory Sidecar Memory Conflict 修复方案”；该源文件不在当前仓库中。
 
 小模型不负责：
 

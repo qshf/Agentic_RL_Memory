@@ -184,7 +184,7 @@ ccb36322, 0a995998, 3a704032, dd2973ad,
 - DeepSeek 判定：`results/rolling_summary/rolling-summary-eval120-v1-atomic-c2/deepseek_judgments.jsonl`
 - 判定汇总：`results/rolling_summary/rolling-summary-eval120-v1-atomic-c2/deepseek_judgments_summary.json`
 - 轨迹数据库：`results/rolling_summary/rolling-summary-eval120-v1-atomic-c2/trajectory.sqlite3`
-- 人工审核页：`docs/plan/rolling_summary_v1_manual_review.html`
+- 人工审核页：[rolling_summary_v1_manual_review.html](rolling_summary_v1_manual_review.html)
 - 审核页生成脚本：`scripts/build_manual_review_html.py`
 - 上下文充分样本的 DeepSeek 新答案：`results/rolling_summary/rolling-summary-eval120-v1-atomic-c2/deepseek_regenerated_context_good.jsonl`
 - 新答案 judge 结果：`results/rolling_summary/rolling-summary-eval120-v1-atomic-c2/deepseek_regenerated_context_good_judgments.jsonl`

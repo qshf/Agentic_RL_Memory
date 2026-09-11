@@ -1,6 +1,6 @@
 # Memory Sidecar V2 单样本处理流程
 
-本文说明 [`process_one_v2()`](../../memory_sidecar/process_v2.py) 当前的实际执行逻辑。它处理一个 question_id：从完整历史中抽取版本化记忆，处理金额漏抽，最终使用 current memory 和近期原文回答问题。
+本文说明 [`process_one_v2()`](../../../../memory_sidecar/process_v2.py) 当前的实际执行逻辑。它处理一个 question_id：从完整历史中抽取版本化记忆，处理金额漏抽，最终使用 current memory 和近期原文回答问题。
 
 ## 总览
 
@@ -98,13 +98,13 @@ repair 的合并结果仍会再次通过金额覆盖检查。若 repair 解析�
 
 ## 4. batch router 与版本变化
 
-实际路由调用在 [`process_v2.py`](../../memory_sidecar/process_v2.py) 中：
+实际路由调用在 [`process_v2.py`](../../../../memory_sidecar/process_v2.py) 中：
 
 ```python
 routes = state.route_batch(events, compiled, batch_ordinal)
 ```
 
-规则实现位于 [`V2MemoryState.route_batch()`](../../memory_sidecar/v2.py)。它对一个 batch 的所有 event 使用 batch 开始时的 current memory 快照：
+规则实现位于 [`V2MemoryState.route_batch()`](../../../../memory_sidecar/v2.py)。它对一个 batch 的所有 event 使用 batch 开始时的 current memory 快照：
 
 ```mermaid
 flowchart TD

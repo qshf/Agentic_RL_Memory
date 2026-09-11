@@ -141,6 +141,6 @@ V4 在 assistant/user 单 session 题上表现稳定；主要损失集中在 mul
 
 - [V4 shard 1 轨迹](/Users/qshf/my-project/Agentic_RL_Memory/results/memory_sidecar/sidecar-v4-pilot24-shard1-20260829)
 - [V4 shard 2 轨迹](/Users/qshf/my-project/Agentic_RL_Memory/results/memory_sidecar/sidecar-v4-pilot24-shard2-20260829)
-- [V4 smoke 与修复记录](/Users/qshf/my-project/Agentic_RL_Memory/docs/plan/2026-08-29_memory_sidecar_v4_smoke4_evaluation.md)
+- [V4 smoke 与修复记录](2026-08-29_memory_sidecar_v4_smoke4_evaluation.md)
 - Git 实现提交：`247e316`
 - Git 结果记录提交：`7e6218e`

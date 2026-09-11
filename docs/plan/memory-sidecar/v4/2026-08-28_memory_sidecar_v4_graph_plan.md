@@ -366,8 +366,8 @@ V4 可作为 V3 的后续主线需同时满足：
 
 ## 13. 可复现产物
 
-- 计划文档：`docs/plan/2026-08-28_memory_sidecar_v4_graph_plan.md`
-- V3 基线与结果：`docs/plan/2026-08-28_memory_sidecar_v3_2048_24_evaluation.md`
+- 计划文档：[2026-08-28_memory_sidecar_v4_graph_plan.md](2026-08-28_memory_sidecar_v4_graph_plan.md)
+- V3 基线与结果：[2026-08-28_memory_sidecar_v3_2048_24_evaluation.md](../v3/2026-08-28_memory_sidecar_v3_2048_24_evaluation.md)
 - V4 运行目录：`results/memory_sidecar/sidecar-v4-graph-*`
 - V4 轨迹数据库：每个 run 独立保存 `trajectory.sqlite3`
 - V4 judge：每个 run 保存 `deepseek_judgments.jsonl` 和汇总 JSON

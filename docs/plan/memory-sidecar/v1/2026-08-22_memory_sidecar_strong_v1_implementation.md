@@ -132,7 +132,7 @@ flowchart TD
 
 本节记录的是当时的 V1 实现，不代表下一版修复方案。V1 对同 key 的不同 value `ADD` 直接返回 `rejected_add_conflict`，不会自动判断“补充”还是“替换”；旧值继续保持 active，新候选只保存在 `sidecar_events` 的原始事件和路由结果中。因此，V1 会出现事实已经在 manager 输入中、但没有进入最终 `sidecar_memory` 的情况。
 
-该缺陷及新的 `merge/UPDATE/conflict_pending` 路由方案单独记录在：[Memory Sidecar Memory Conflict 修复方案](2026-08-23_memory_sidecar_memory_conflict_resolution_v1.md)。
+该缺陷及新的 `merge/UPDATE/conflict_pending` 路由方案曾单独记录在“Memory Sidecar Memory Conflict 修复方案”；该源文件不在当前仓库中。
 
 ### 示例：贷款额度被新值替换
 

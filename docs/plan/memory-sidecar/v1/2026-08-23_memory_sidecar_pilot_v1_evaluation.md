@@ -202,7 +202,7 @@ Sidecar run：
 - DeepSeek 替换答案：`results/memory_sidecar/sidecar-strong-pilot-24-v1-c2-selected/deepseek_context_sufficient_{rolling,sidecar}.jsonl`
 - DeepSeek 替换答案 judge：`results/memory_sidecar/sidecar-strong-pilot-24-v1-c2-selected/deepseek_context_sufficient_{rolling,sidecar}_judgments_summary.json`
 - DeepSeek 替换脚本：`scripts/compare_deepseek_context_sufficient.py`
-- Rolling V1 baseline evaluation：`docs/plan/2026-08-21_rolling_summary_baseline_v1_evaluation.md`
+- Rolling V1 baseline evaluation：[Rolling Summary Baseline V1 评估记录](../../baseline/rolling-summary/v1/2026-08-21_rolling_summary_baseline_v1_evaluation.md)
 
 ## 7. 可比性限制
 
